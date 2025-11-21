@@ -1,21 +1,19 @@
-from langchain_groq import ChatGroq
 from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.tools import tool
-from env import GROQ_API_KEY
+from src.config.env import OPENAI_API_KEY
 import json
-
-# --- Initialize model ---
-model = ChatGroq(model="openai/gpt-oss-120b", api_key=GROQ_API_KEY)
 
 # --- Create memory ---
 memory = MemorySaver()
 
 # --- Create TTS text converter agent ---
-tts_converter = create_react_agent(
-    model=model,
-    tools=[],  # No tools needed for this agent
-    prompt="""
+# --- Create TTS text converter agent ---
+def get_tts_converter_agent(model):
+    return create_react_agent(
+        model=model,
+        tools=[],  # No tools needed for this agent
+        prompt="""
 You are TTSTextConverter, an expert at transforming written text into natural-sounding speech optimized for text-to-speech systems.
 
 Your task is to take summarized text and rewrite it to sound more like a human speaking naturally. Focus on:
@@ -51,9 +49,19 @@ Important:
 - Ensure JSON is valid and properly formatted
 - Keep the converted text concise and focused on natural speech patterns
 """,
-    checkpointer=memory,
-    name="TTSTextConverter",
-)
+        checkpointer=memory,
+        name="TTSTextConverter",
+    )
+
+# Backward compatibility
+try:
+    from src.config.model_config import default_model
+    if default_model:
+        tts_converter = get_tts_converter_agent(default_model)
+    else:
+        tts_converter = None
+except Exception:
+    tts_converter = None
 
 # --- Example usage ---
 if __name__ == "__main__":

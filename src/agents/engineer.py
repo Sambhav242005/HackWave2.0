@@ -1,10 +1,7 @@
-from langchain_groq import ChatGroq
 from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.memory import MemorySaver
-from agentComp import ClarifierResp, ProductResp
-from env import GROQ_API_KEY
-# --- Initialize model ---
-model = ChatGroq(model="openai/gpt-oss-120b", api_key=GROQ_API_KEY)
+from src.models.agentComp import ClarifierResp, ProductResp
+from src.config.model_config import get_model
 
 # --- Create memory ---
 memory = MemorySaver()
@@ -22,27 +19,21 @@ For each feature, you must:
 4. Estimate implementation time
 5. Provide detailed reasoning
 
-Your response must be a valid JSON object with this structure:
-{
-  "done": false,
-  "features": [
-    {
-      "feature": "",
-      "feasible": 0-1,
-      "reason": "",
-      "implementation_time": "2Hd",
-      "dependencies": [],
-      "conflicts": [],
-      "impact_score": 0-1
-    }
-  ],
-  "summary": "",
-  "recommendations": []
-}
+Your response must be in TOON (Token-Oriented Object Notation) format:
+
+```toon
+done: false
+summary: Summary text
+recommendations:
+  Rec 1, Rec 2
+features:
+  feature, feasible, reason, implementation_time, dependencies, conflicts, impact_score
+  Feature 1, 0.9, Reason, 2d, [], [], 0.8
+```
 
 Important:
-- Respond with ONLY the JSON object, no other text
-- Ensure the JSON is valid and properly formatted
+- Respond with ONLY the TOON data
+- Use the exact format shown above
 - Each round, add at least one new feature to the list
 - After gathering at least 5 features, set "done" to true
 - Only leave answers empty for 3-5 critical questions that require user input
@@ -56,8 +47,6 @@ Important:
   * Impact on overall product architecture
 - After analyzing all features, provide a comprehensive summary and actionable recommendations
 
-You start with no features. Ask the user for the first feature.
-
 Current features: {current_features}
 Current analysis: {current_analysis}
 
@@ -65,11 +54,29 @@ Question: {input}
 Thought:{agent_scratchpad}
 """
 # --- Create agents ---
-engineer = create_react_agent(
-    model=model,
-    tools=[],
-    prompt=engineer_prompt,
-    checkpointer=memory,
-    name="Engineer",
-    # response_format=ClarifierResp
-)
+from src.config.model_limits import get_agent_limit
+
+# --- Create agents ---
+def get_engineer_agent(model):
+    max_tokens = get_agent_limit("engineer", "max_tokens", 2000)
+    if max_tokens:
+        model = model.bind(max_tokens=max_tokens)
+    
+    return create_react_agent(
+        model=model,
+        tools=[],
+        prompt=engineer_prompt,
+        checkpointer=memory,
+        name="Engineer",
+        # response_format=ClarifierResp
+    )
+
+# Backward compatibility
+try:
+    from src.config.model_config import default_model
+    if default_model:
+        engineer = get_engineer_agent(default_model)
+    else:
+        engineer = None
+except Exception:
+    engineer = None

@@ -1,10 +1,6 @@
-from langchain_groq import ChatGroq
 from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.memory import MemorySaver
-from env import GROQ_API_KEY
-
-# --- Initialize model ---
-model = ChatGroq(model="openai/gpt-oss-120b", api_key=GROQ_API_KEY)
+from src.config.model_config import get_model
 
 # --- Create memory ---
 memory = MemorySaver()
@@ -21,30 +17,21 @@ For each feature, you must:
 4. Assess the impact on user rights and data security
 5. Provide actionable recommendations for compliance
 
-Your response must be a valid JSON object with this structure:
-{
-  "done": false,
-  "features": [
-    {
-      "feature": "",
-      "law_interaction": "Description of how the feature interacts with relevant laws",
-      "is_potential_risk": true/false,
-      "potential_risk": "Detailed description of potential legal risks",
-      "border_line_thing": "Borderline legal considerations to keep in mind",
-      "gdpr_compliance": "Specific GDPR compliance assessment",
-      "data_retention": "Data retention requirements and implications",
-      "user_consent": "Consent requirements and implementation",
-      "risk_level": "low/medium/high",
-      "mitigation": "Specific actions to mitigate identified risks"
-    }
-  ],
-  "summary": "Overall risk assessment summary",
-  "recommendations": ["List of actionable recommendations"]
-}
+Your response must be in TOON (Token-Oriented Object Notation) format:
+
+```toon
+done: false
+summary: Overall risk assessment summary
+recommendations:
+  Rec 1, Rec 2
+features:
+  feature, law_interaction, is_potential_risk, potential_risk, border_line_thing, gdpr_compliance, data_retention, user_consent, risk_level, mitigation
+  Feature 1, Interaction, true, Risk desc, Borderline, GDPR, Retention, Consent, high, Mitigation
+```
 
 Important Guidelines:
-- Respond with ONLY the JSON object, no other text
-- Ensure the JSON is valid and properly formatted
+- Respond with ONLY the TOON data
+- Use the exact format shown above
 - Each round, analyze at least one new feature
 - After analyzing all features, set "done" to true
 - Focus specifically on:
@@ -68,10 +55,28 @@ Thought:{agent_scratchpad}
 """
 
 # --- Create agents ---
-risk = create_react_agent(
-    model=model,
-    tools=[],
-    prompt=risk_prompt,
-    checkpointer=memory,
-    name="Risk",
-)
+from src.config.model_limits import get_agent_limit
+
+# --- Create agents ---
+def get_risk_agent(model):
+    max_tokens = get_agent_limit("risk", "max_tokens", 2000)
+    if max_tokens:
+        model = model.bind(max_tokens=max_tokens)
+        
+    return create_react_agent(
+        model=model,
+        tools=[],
+        prompt=risk_prompt,
+        checkpointer=memory,
+        name="Risk",
+    )
+
+# Backward compatibility
+try:
+    from src.config.model_config import default_model
+    if default_model:
+        risk = get_risk_agent(default_model)
+    else:
+        risk = None
+except Exception:
+    risk = None

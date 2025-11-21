@@ -3,30 +3,47 @@ import time
 import pygame
 from typing import Dict, Any, Optional, List
 from langchain_core.messages import HumanMessage, BaseMessage
-from env import GROQ_API_KEY
 
 # Import agents and utilities
-from agent import clarifier, product
-from agentComp import ClarifierResp, ProductResp
-from helper import get_user_input, process_agent_response
-from engineer import engineer
-from customer import customer
-from risk import risk
-from summarizer import summarizer_agent
-from prompt import prompt_generator
-from diagramAgent import generate_mermaid_link
-from tts_summarize import tts_converter
-from tts import TextToSpeech, synthesize_text_with_rate_limit
+from src.agents.agent import get_clarifier_agent, get_product_agent
+from src.models.agentComp import ClarifierResp, ProductResp
+from src.utils.helper import get_user_input, process_agent_response
+from src.agents.engineer import get_engineer_agent
+from src.agents.customer import get_customer_agent
+from src.agents.risk import get_risk_agent
+from src.agents.summarizer import get_summarizer_agent
+from src.utils.prompt import get_prompt_generator_agent
+from src.services.diagram.diagramAgent import generate_mermaid_link
+from src.services.tts.tts_summarize import get_tts_converter_agent
+from src.services.tts.tts import TextToSpeech, synthesize_text_with_rate_limit
+from src.config.model_config import get_model
 
 class ProductConversationManager:
     def __init__(self, thread_id: str = "product_conversation",
                  text_input: Optional[str] = None,
                  image_input: Optional[str] = None,
-                 audio_input: Optional[str] = None):
+                 audio_input: Optional[str] = None,
+                 model_provider: str = "openai",
+                 max_questions: int = 5,
+                 max_features: int = 5):
         self.config = {"configurable": {"thread_id": thread_id}}
         self.text_input = text_input
         self.image_input = image_input
         self.audio_input = audio_input
+        self.model_provider = model_provider
+        self.max_questions = max_questions
+        self.max_features = max_features
+        
+        # Initialize model and agents with agent-specific models
+        self.clarifier_agent = get_clarifier_agent(get_model(provider=model_provider, agent_type="clarifier"), max_questions=max_questions)
+        self.product_agent = get_product_agent(get_model(provider=model_provider, agent_type="product"), max_features=max_features)
+        self.customer_runner = get_customer_agent(get_model(provider=model_provider, agent_type="customer"))
+        self.engineer_agent = get_engineer_agent(get_model(provider=model_provider, agent_type="engineer"))
+        self.risk_agent = get_risk_agent(get_model(provider=model_provider, agent_type="risk"))
+        self.summarizer_agent = get_summarizer_agent(get_model(provider=model_provider, agent_type="summarizer"))
+        self.prompt_generator = get_prompt_generator_agent(get_model(provider=model_provider, agent_type="prompt_generator"))
+        self.tts_converter = get_tts_converter_agent(get_model(provider=model_provider, agent_type="tts_converter"))
+
         self.final_data: Dict[str, Any] = {
             "clarifier": None,
             "product": None,
@@ -47,7 +64,9 @@ class ProductConversationManager:
 
     def generate_enhanced_prompt(self) -> str:
         """Generate an enhanced prompt using multiple input modalities"""
+        print("DEBUG: Entering generate_enhanced_prompt")
         if not any([self.text_input, self.image_input, self.audio_input]):
+            print("DEBUG: No inputs provided, returning default prompt")
             return "Create a mobile app for fitness tracking with step counting, calorie monitoring, and sleep analysis."
 
         inputs = {
@@ -59,33 +78,46 @@ class ProductConversationManager:
                 )
             ]
         }
-        result = prompt_generator.invoke(inputs, config=self.config)
-        return result["messages"][-1].content
+        print(f"DEBUG: Invoking prompt_generator with inputs: {inputs}")
+        try:
+            result = self.prompt_generator.invoke(inputs, config=self.config)
+            print("DEBUG: prompt_generator invoked successfully")
+            return result["messages"][-1].content
+        except Exception as e:
+            print(f"DEBUG: Error in prompt_generator: {e}")
+            raise e
 
-    def run_clarifier_conversation(self, max_rounds: int = 5, max_user_inputs: int = 4,
+    def run_clarifier_conversation(self, max_rounds: int = 3, max_user_inputs: int = 4,
                                   user_input_callback=None, clarifier_callback=None) -> bool:
         """Run the clarifier conversation loop with enhanced prompt"""
         print("Starting Clarifier conversation...")
 
         # Generate enhanced prompt if inputs are provided
+        print("DEBUG: Calling generate_enhanced_prompt")
         initial_prompt = self.generate_enhanced_prompt()
+        print(f"DEBUG: Enhanced prompt generated: {initial_prompt[:50]}...")
+        
         initial_message = HumanMessage(
             content=f"Start gathering requirements for a new mobile app based on this: {initial_prompt}. "
-                   "Only ask 3-5 critical questions that require user input."
+                   f"Only ask {self.max_questions} critical questions that require user input."
         )
 
         # Initial invocation
-        clarifier_result = clarifier.invoke({"messages": [initial_message]}, self.config)
+        print("DEBUG: Invoking clarifier_agent (Round 1)")
+        clarifier_result = self.clarifier_agent.invoke({"messages": [initial_message]}, self.config)
+        print("DEBUG: clarifier_agent invoked successfully")
+        
         self.clarifier_messages = clarifier_result.get("messages", [])
         if not self.clarifier_messages:
             print("Error: Clarifier agent returned no messages")
             return False
 
         clarifier_response = self.clarifier_messages[-1].content
+        usage_metadata = self.clarifier_messages[-1].response_metadata.get("token_usage") if hasattr(self.clarifier_messages[-1], "response_metadata") else None
         print(f"Clarifier (Round 1): {clarifier_response}")
 
         # Process the response
-        clarifier_obj = process_agent_response(clarifier_response, ClarifierResp)
+        clarifier_obj = process_agent_response(clarifier_response, ClarifierResp, usage_metadata)
         if clarifier_obj:
             self.final_data["clarifier"] = clarifier_obj.model_dump()
             print(json.dumps(self.final_data["clarifier"], indent=2))
@@ -118,16 +150,17 @@ class ProductConversationManager:
                         print(f"\nUser inputs collected: {user_inputs_collected}/{max_user_inputs}")
 
             # Continue conversation
-            clarifier_result = clarifier.invoke({"messages": self.clarifier_messages}, self.config)
+            clarifier_result = self.clarifier_agent.invoke({"messages": self.clarifier_messages}, self.config)
             self.clarifier_messages = clarifier_result.get("messages", [])
             if not self.clarifier_messages:
                 print("Error: Clarifier agent returned no messages in subsequent rounds")
                 return False
 
             clarifier_response = self.clarifier_messages[-1].content
+            usage_metadata = self.clarifier_messages[-1].response_metadata.get("token_usage") if hasattr(self.clarifier_messages[-1], "response_metadata") else None
             print(f"\nClarifier (Round {round_num+1}): {clarifier_response}")
 
-            clarifier_obj = process_agent_response(clarifier_response, ClarifierResp)
+            clarifier_obj = process_agent_response(clarifier_response, ClarifierResp, usage_metadata)
             if clarifier_obj:
                 self.final_data["clarifier"] = clarifier_obj.model_dump()
                 print(json.dumps(self.final_data["clarifier"], indent=2))
@@ -142,7 +175,7 @@ class ProductConversationManager:
             return False
 
         # Initial invocation
-        product_result = product.invoke({"messages": self.clarifier_messages}, self.config)
+        product_result = self.product_agent.invoke({"messages": self.clarifier_messages}, self.config)
         self.product_messages = product_result.get("messages", [])
         if not self.product_messages:
             print("Error: Product agent returned no messages")
@@ -189,7 +222,7 @@ class ProductConversationManager:
                     "}\n\n"
                     "Make sure to include at least 5 features. Do not include any questions or other text."
                 )
-                product_result = product.invoke(
+                product_result = self.product_agent.invoke(
                     {"messages": self.product_messages + [retry_message]},
                     self.config
                 )
@@ -261,7 +294,7 @@ class ProductConversationManager:
             return False
 
         product_response = self.product_messages[-1].content
-        customer_result = customer(product_response)
+        customer_result = self.customer_runner(product_response)
         if not customer_result:
             print("Error: Customer agent returned no result")
             return False
@@ -281,7 +314,7 @@ class ProductConversationManager:
             print("Error: No customer data available for engineer agent")
             return False
 
-        engineer_result = engineer.invoke(
+        engineer_result = self.engineer_agent.invoke(
             {"messages": [HumanMessage(content=json.dumps(self.final_data["customer"]))]},
             self.config
         )
@@ -290,12 +323,33 @@ class ProductConversationManager:
             return False
 
         engineer_response = engineer_result["messages"][-1].content
+        usage_metadata = engineer_result["messages"][-1].response_metadata.get("token_usage") if hasattr(engineer_result["messages"][-1], "response_metadata") else None
+        
+        # Use helper to parse (supports JSON and TOON) and track usage
+        # We don't have a specific Pydantic model for the full response structure in agentComp.py 
+        # that matches the TOON structure exactly (EngineerAnalysis has features list), 
+        # but let's try to parse it to a dict first using toon.loads if helper fails or just use helper with a dummy model?
+        # Actually, helper.process_agent_response requires a model.
+        # Let's just track usage manually and use toon.parse_response directly if needed, 
+        # or better, use the helper with the EngineerAnalysis model if it matches.
+        
+        from src.utils.token_tracker import token_tracker
+        if usage_metadata:
+            token_tracker.track_usage(usage_metadata)
+            
         try:
-            self.final_data["engineer"] = {"analysis": json.loads(engineer_response)}
-            print(engineer_response)
+            from src.utils import toon
+            # Try TOON parsing first since we switched to TOON
+            parsed = toon.parse_response(engineer_response)
+            if not parsed:
+                # Fallback to JSON
+                parsed = json.loads(engineer_response)
+                
+            self.final_data["engineer"] = {"analysis": parsed}
+            print(json.dumps(parsed, indent=2))
             return True
-        except json.JSONDecodeError:
-            print("Error: Failed to parse engineer response as JSON")
+        except Exception as e:
+            print(f"Error: Failed to parse engineer response: {e}")
             return False
 
     def run_risk_agent(self) -> bool:
@@ -305,7 +359,7 @@ class ProductConversationManager:
             print("Error: No engineer data available for risk agent")
             return False
 
-        risk_result = risk.invoke(
+        risk_result = self.risk_agent.invoke(
             {"messages": [HumanMessage(content=json.dumps(self.final_data["engineer"]))]},
             self.config
         )
@@ -314,18 +368,29 @@ class ProductConversationManager:
             return False
 
         risk_response = risk_result["messages"][-1].content
+        usage_metadata = risk_result["messages"][-1].response_metadata.get("token_usage") if hasattr(risk_result["messages"][-1], "response_metadata") else None
+        
+        from src.utils.token_tracker import token_tracker
+        if usage_metadata:
+            token_tracker.track_usage(usage_metadata)
+
         try:
-            self.final_data["risk"] = {"assessment": json.loads(risk_response)}
-            print(risk_response)
+            from src.utils import toon
+            parsed = toon.parse_response(risk_response)
+            if not parsed:
+                parsed = json.loads(risk_response)
+                
+            self.final_data["risk"] = {"assessment": parsed}
+            print(json.dumps(parsed, indent=2))
             return True
-        except json.JSONDecodeError:
-            print("Error: Failed to parse risk response as JSON")
+        except Exception as e:
+            print(f"Error: Failed to parse risk response: {e}")
             return False
 
     def run_summarizer_agent(self) -> str:
         """Run the summarizer agent and return summary"""
         print("\nGenerating Final Summary...")
-        summary_result = summarizer_agent.invoke(
+        summary_result = self.summarizer_agent.invoke(
             {"messages": [HumanMessage(content=json.dumps(self.final_data, indent=2))]},
             self.config
         )
@@ -345,7 +410,7 @@ class ProductConversationManager:
             return False
 
         # Convert summary to TTS-ready format
-        response = tts_converter.invoke(
+        response = self.tts_converter.invoke(
             {"messages": [("human", summary)]},
             config=self.config
         )
@@ -360,7 +425,14 @@ class ProductConversationManager:
             print("TTS Text:", tts_text)
 
             # Synthesize speech
-            tts = TextToSpeech(GROQ_API_KEY)
+            # Note: TTS still uses an external API endpoint (may require specific TTS API key)
+            from src.config.env import OPENAI_API_KEY
+            
+            if not OPENAI_API_KEY:
+                print("Warning: No API key available for TTS. Skipping audio generation.")
+                return False
+                
+            tts = TextToSpeech(OPENAI_API_KEY)
             out_file = synthesize_text_with_rate_limit(tts, tts_text, out_path=output_file)
             self.final_data["tts_file"] = out_file
             print(f"Audio saved to: {out_file}")

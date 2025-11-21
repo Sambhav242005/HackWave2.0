@@ -1,14 +1,11 @@
-from langchain_groq import ChatGroq
 from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.memory import MemorySaver
-from env import GROQ_API_KEY
-import json
-
-# --- Initialize model ---
-model = ChatGroq(model="openai/gpt-oss-120b", api_key=GROQ_API_KEY)
 
 # --- Create memory ---
 memory = MemorySaver()
+
+from src.utils import toon
+from src.config.model_limits import get_agent_limit
 
 # --- Summarization Agent Prompt ---
 summarizer_prompt = """
@@ -25,40 +22,69 @@ Instructions:
 - Prioritize clarity, conciseness, and completeness.
 
 Output format:
-⚡ **Integrated Summary:**
-[A single merged summary covering all perspectives in a unified way]
+Your response must be in TOON (Token-Oriented Object Notation) format:
 
+```toon
+summary: The integrated summary text...
+```
 
 Input: {input}
 """
 
 # --- Create summarization agent ---
-summarizer_agent = create_react_agent(
-    model=model,
-    tools=[],
-    prompt=summarizer_prompt,
-    checkpointer=memory,
-    name="Summarizer"
-)
+def get_summarizer_agent(model):
+    max_tokens = get_agent_limit("summarizer", "max_tokens", 1000)
+    # Bind the limit to the model
+    if max_tokens:
+        model = model.bind(max_tokens=max_tokens)
+        
+    return create_react_agent(
+        model=model,
+        tools=[],
+        prompt=summarizer_prompt,
+        checkpointer=memory,
+        name="Summarizer"
+    )
+
+# Backward compatibility
+try:
+    from src.config.model_config import default_model
+    if default_model:
+        summarizer_agent = get_summarizer_agent(default_model)
+    else:
+        summarizer_agent = None
+except Exception:
+    summarizer_agent = None
 
 # --- Function to compile agent outputs ---
-def compile_agent_reports(agent_outputs: list) -> str:
+def compile_agent_reports(agent_outputs: list, model=None) -> str:
     """
     Compile outputs from multiple agents into a single markdown report.
 
     Args:
         agent_outputs: List of dictionaries containing agent outputs
                       Each dictionary should have 'agent_name' and 'output' keys
+        model: Optional Chat model instance. If None, uses default.
 
     Returns:
         str: Markdown formatted report
     """
+    if model is None:
+        from src.config.model_config import default_model
+        model = default_model
+        if model is None:
+             raise ValueError("No model provided and default model is not available.")
+
+    agent = get_summarizer_agent(model)
+
     # Create config with thread_id for the checkpointer
     config = {"configurable": {"thread_id": "summarizer_session"}}
 
     # Invoke the summarizer agent with config
-    result = summarizer_agent.invoke({
-        "messages": json.dumps(agent_outputs)
+    # Convert inputs to TOON to save tokens
+    toon_input = toon.dumps({"reports": agent_outputs})
+    result = agent.invoke({
+        "messages": toon_input
     }, config=config)
 
     summarizer_messages = result["messages"]

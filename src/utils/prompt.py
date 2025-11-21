@@ -6,16 +6,15 @@ import io
 import sounddevice as sd
 import soundfile as sf
 import numpy as np
-from groq import Groq
-from langchain_groq import ChatGroq
+from openai import OpenAI
+from langchain_openai import ChatOpenAI
 from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.tools import tool
-from env import GROQ_API_KEY
+from src.config.env import OPENAI_API_KEY, OPENAI_API_BASE
 
-# --- Initialize Groq clients ---
-groq_client = Groq(api_key=GROQ_API_KEY)
-model = ChatGroq(model="meta-llama/llama-4-scout-17b-16e-instruct", api_key=GROQ_API_KEY)
+# --- Initialize OpenAI client ---
+openai_client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_API_BASE)
 
 # --- Create memory ---
 memory = MemorySaver()
@@ -73,7 +72,7 @@ def get_mime_type(file_path):
 # --- Define tools for processing different input types ---
 @tool
 def analyze_image(image_input: str) -> str:
-    """Analyze an image using Groq's vision model.
+    """Analyze an image using OpenAI's vision model.
     Args:
         image_input: Either a URL of the image or a local file path to the image.
     Returns:
@@ -83,11 +82,10 @@ def analyze_image(image_input: str) -> str:
         # Check if input is a URL or local file path
         if image_input.startswith('http'):
             # It's a URL
-            image_url = image_input
             image_content = {
                 "type": "image_url",
                 "image_url": {
-                    "url": image_url
+                    "url": image_input
                 }
             }
         else:
@@ -107,8 +105,8 @@ def analyze_image(image_input: str) -> str:
                 }
             }
 
-        completion = groq_client.chat.completions.create(
-            model="meta-llama/llama-4-scout-17b-16e-instruct",
+        completion = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
             messages=[
                 {
                     "role": "user",
@@ -122,9 +120,7 @@ def analyze_image(image_input: str) -> str:
                 }
             ],
             temperature=0.2,
-            max_completion_tokens=1024,
-            top_p=1,
-            stream=False,
+            max_tokens=1024,
             response_format={"type": "json_object"},
         )
         return completion.choices[0].message.content
@@ -133,7 +129,7 @@ def analyze_image(image_input: str) -> str:
 
 @tool
 def transcribe_audio(audio_input: str) -> str:
-    """Transcribe audio file to text using Groq's Whisper model.
+    """Transcribe audio file to text using OpenAI's Whisper model.
     Args:
         audio_input: Either a file path to an audio file or "RECORD" to record new audio.
     Returns:
@@ -145,20 +141,19 @@ def transcribe_audio(audio_input: str) -> str:
             audio_bytes = record_audio()
             # Create a file-like object from bytes
             audio_file = io.BytesIO(audio_bytes)
-            transcription = groq_client.audio.transcriptions.create(
-                file=("recorded_audio.wav", audio_file),
-                model="whisper-large-v3-turbo",
-                response_format="text",
+            audio_file.name = "recorded_audio.wav"
+            transcription = openai_client.audio.transcriptions.create(
+                file=audio_file,
+                model="whisper-1",
             )
         else:
             # Use provided file path
             with open(audio_input, "rb") as file:
-                transcription = groq_client.audio.transcriptions.create(
-                    file=(os.path.basename(audio_input), file.read()),
-                    model="whisper-large-v3-turbo",
-                    response_format="text",
+                transcription = openai_client.audio.transcriptions.create(
+                    file=file,
+                    model="whisper-1",
                 )
-        return transcription
+        return transcription.text
     except Exception as e:
         return f"Audio transcription failed: {str(e)}"
 
@@ -171,8 +166,8 @@ def process_text(text_input: str) -> str:
         Structured summary of key points from the text.
     """
     try:
-        completion = groq_client.chat.completions.create(
-            model="meta-llama/llama-4-scout-17b-16e-instruct",
+        completion = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
             messages=[
                 {
                     "role": "system",
@@ -184,9 +179,7 @@ def process_text(text_input: str) -> str:
                 }
             ],
             temperature=0.2,
-            max_completion_tokens=1024,
-            top_p=1,
-            stream=False,
+            max_tokens=1024,
             response_format={"type": "json_object"},
         )
         return completion.choices[0].message.content
@@ -194,10 +187,11 @@ def process_text(text_input: str) -> str:
         return json.dumps({"error": f"Text processing failed: {str(e)}"})
 
 # --- Create the prompt generation agent ---
-prompt_generator = create_react_agent(
-    model=model,
-    tools=[analyze_image, transcribe_audio, process_text],
-    prompt="""
+def get_prompt_generator_agent(model):
+    return create_react_agent(
+        model=model,
+        tools=[analyze_image, transcribe_audio, process_text],
+        prompt="""
 You are a Prompt Generation Specialist.
 Your task is to convert image, audio, and text inputs into a comprehensive,
 well-structured prompt that clearly defines requirements for a product or system and definition of the product.
@@ -229,9 +223,19 @@ Important:
 - Prioritize requirements that appear in multiple sources
 - Include specific details mentioned in any input
 """,
-    checkpointer=memory,
-    name="PromptGenerator",
-)
+        checkpointer=memory,
+        name="PromptGenerator",
+    )
+
+# Backward compatibility
+try:
+    from src.config.model_config import default_model
+    if default_model:
+        prompt_generator = get_prompt_generator_agent(default_model)
+    else:
+        prompt_generator = None
+except Exception:
+    prompt_generator = None
 
 # --- Example usage ---
 if __name__ == "__main__":
@@ -261,3 +265,4 @@ if __name__ == "__main__":
     # Generate the enhanced prompt
     result = prompt_generator.invoke(inputs, config=config)
     print(result["messages"][-1].content)
+

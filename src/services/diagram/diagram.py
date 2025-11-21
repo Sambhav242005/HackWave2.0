@@ -2,14 +2,11 @@ import json
 import base64
 import uuid
 import webbrowser
-from langchain_groq import ChatGroq
 from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.tools import tool
-from env import GROQ_API_KEY
-
-# --- Initialize model ---
-model = ChatGroq(model="deepseek-r1-distill-llama-70b", api_key=GROQ_API_KEY)
+from src.config.env import OPENAI_API_KEY
+from src.config.model_config import get_model
 
 # --- Create memory ---
 memory = MemorySaver()
@@ -39,44 +36,36 @@ diagram_generator = create_react_agent(
     prompt="""
 You are DiagramGenerator, an expert in creating visual diagrams using Mermaid syntax.
 Your task is to take a product summary or JSON description and generate a Mermaid diagram that visualizes the product's architecture, components, or workflow.
+
 Follow these steps:
 1. Analyze the input product summary/JSON to identify key components and relationships
 2. Generate appropriate Mermaid code (flowchart, sequence diagram, class diagram, etc.)
 3. Use the mermaid_visualizer tool to display the diagram
 4. Provide an explanation of what the diagram represents
-5. Ask for feedback and offer to make improvements
-Your response must be a valid JSON object with this structure:
-{
-  "done": false,
-  "diagram": "Mermaid code here",
-  "explanation": "Explanation of the diagram",
-  "feedback_question": "What would you like to improve in this diagram?"
-}
-OR when final version is ready:
+
+Important:
+- Always use the mermaid_visualizer tool after generating the diagram code
+- Do not attempt to use any other tools
+- Do not include any tool calls in your JSON response
+- Your response must be a valid JSON object with this structure:
 {
   "done": true,
-  "diagram": "Final Mermaid code",
-  "explanation": "Final explanation of the diagram"
+  "diagram": "Mermaid code here",
+  "explanation": "Explanation of the diagram"
 }
-Important:
 - Respond with ONLY the JSON object, no other text
 - Ensure JSON is valid and properly formatted
-- Always use the mermaid_visualizer tool after generating diagram code
-- For complex products, start with a high-level diagram before adding details
-- Set "done" to true only when user confirms satisfaction with the diagram
 """,
     checkpointer=memory,
     name="DiagramGenerator",
 )
 
-def generate_mermaid_link(summary: str, open_in_browser: bool = True) -> str:
+def generate_mermaid_link(summary: str, open_in_browser: bool = False) -> str:
     """
     Generate a Mermaid diagram link from a product summary.
-
     Args:
         summary: Product summary as text or JSON string
         open_in_browser: Whether to automatically open the diagram in a browser
-
     Returns:
         URL to the generated Mermaid diagram
     """
@@ -94,12 +83,24 @@ def generate_mermaid_link(summary: str, open_in_browser: bool = True) -> str:
     try:
         # Get the last message content
         last_message = response['messages'][-1]
-        # Try to parse as JSON
-        result = json.loads(last_message.content)
-        mermaid_code = result.get('diagram', '')
+        content = last_message.content
 
-        if not mermaid_code:
-            raise ValueError("No diagram code found in response")
+        # Try to parse as JSON
+        try:
+            result = json.loads(content)
+            mermaid_code = result.get('diagram', '')
+            if not mermaid_code:
+                raise ValueError("No diagram code found in response")
+        except json.JSONDecodeError:
+            # If the response isn't JSON, try to extract the diagram code directly
+            print("Response wasn't in JSON format. Attempting to extract diagram code...")
+            # Look for mermaid code block
+            import re
+            mermaid_match = re.search(r'```mermaid\n(.*?)\n```', content, re.DOTALL)
+            if mermaid_match:
+                mermaid_code = mermaid_match.group(1)
+            else:
+                raise ValueError("Could not extract diagram code from response")
 
         # Encode the Mermaid code for URL
         graphbytes = mermaid_code.encode("ascii")
@@ -109,52 +110,22 @@ def generate_mermaid_link(summary: str, open_in_browser: bool = True) -> str:
         # Create the URL that generates the image
         url = "https://mermaid.ink/img/" + base64_string
 
-        # Optionally open in browser
-        if open_in_browser:
-            print("▶️  Opening diagram in your web browser...")
-            webbrowser.open(url)
-            print("✅ Done!")
+        # # Optionally open in browser
+        # if open_in_browser:
+        #     print("▶️  Opening diagram in your web browser...")
+        #     webbrowser.open(url)
+        #     print("✅ Done!")
 
         # Print explanation if available
-        explanation = result.get('explanation', '')
-        if explanation:
-            print("\nDiagram Explanation:")
-            print(explanation)
-
-        # Print feedback question if not done
-        if not result.get('done', False):
-            feedback_question = result.get('feedback_question', '')
-            if feedback_question:
-                print("\nFeedback Question:")
-                print(feedback_question)
+        if 'result' in locals() and 'explanation' in result:
+            explanation = result.get('explanation', '')
+            if explanation:
+                print("\nDiagram Explanation:")
+                print(explanation)
 
         return url
-
-    except json.JSONDecodeError:
-        # Handle case where response isn't JSON
-        print("Response wasn't in JSON format. Raw content:")
-        print(last_message.content)
-        raise ValueError("Failed to parse diagram generator response")
     except Exception as e:
         print(f"Error generating diagram: {str(e)}")
+        print("Raw response content:")
+        print(content if 'content' in locals() else "No content available")
         raise
-
-# Example usage:
-if __name__ == "__main__":
-    # Example with text summary
-    text_summary = "A fitness tracking app with user profiles, workout logging, and progress charts"
-    print("Generating diagram from text summary...")
-    diagram_url = generate_mermaid_link(text_summary)
-    print(f"Diagram URL: {diagram_url}")
-
-    # Example with JSON
-    product_json = """
-    {
-      "name": "E-commerce Platform",
-      "components": ["User Auth", "Product Catalog", "Shopping Cart", "Payment Gateway"],
-      "flow": "User browses products → Adds to cart → Checks out → Pays"
-    }
-    """
-    print("\nGenerating diagram from JSON...")
-    diagram_url = generate_mermaid_link(product_json)
-    print(f"Diagram URL: {diagram_url}")

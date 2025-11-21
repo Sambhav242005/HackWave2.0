@@ -9,7 +9,6 @@ from typing import List
 from pathlib import Path
 import requests
 import pygame
-from env import GROQ_API_KEY
 
 # TTS Configuration
 SINGLE_VOICE = "Fritz-PlayAI"
@@ -296,7 +295,14 @@ def synthesize_text_with_rate_limit(tts: TextToSpeech, full_text: str, out_path:
 
 # ----------------- Example usage -----------------
 if __name__ == "__main__":
-    tts = TextToSpeech(GROQ_API_KEY)
+    # Note: TTS requires an API key. Pass it as a parameter.
+    import sys
+    if len(sys.argv) < 2:
+        print("Usage: python tts.py <api_key>")
+        sys.exit(1)
+    
+    api_key = sys.argv[1]
+    tts = TextToSpeech(api_key)
 
     # Use a shorter summary for testing
     summary = """
@@ -321,3 +327,4 @@ if __name__ == "__main__":
             print("Playback failed:", e)
     except Exception as e:
         print("Synthesis failed:", e)
+

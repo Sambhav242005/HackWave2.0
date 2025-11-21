@@ -20,7 +20,7 @@ from PyQt5.QtGui import QFont, QPixmap, QImage, QPalette, QColor
 import pygame
 
 # Import your existing classes
-from refinedModelClass import ProductConversationManager
+from src.ui.controller import ProductConversationManager
 
 
 class WorkerThread(QThread):
