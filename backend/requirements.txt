@@ -6,3 +6,7 @@ langchain
 python-dotenv
 gradio
 requests
+langchain_openai
+sounddevice
+soundfile
+pygame
