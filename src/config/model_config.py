@@ -63,7 +63,6 @@ def get_model(temperature: float = 0.1, model_name: str = None, provider: str = 
             model=selected_model,
             api_key=OPENAI_API_KEY,
             base_url=api_base,
-            temperature=temperature
         )
     else:
         raise ValueError(f"Provider '{provider}' is not supported. Use 'openai'.")

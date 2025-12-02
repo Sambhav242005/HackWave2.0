@@ -17,6 +17,7 @@ from src.services.diagram.diagramAgent import generate_mermaid_link
 from src.services.tts.tts_summarize import get_tts_converter_agent
 from src.services.tts.tts import TextToSpeech, synthesize_text_with_rate_limit
 from src.config.model_config import get_model
+from src.config.model_limits import get_agent_limit
 
 class ProductConversationManager:
     def __init__(self, thread_id: str = "product_conversation",
@@ -24,13 +25,20 @@ class ProductConversationManager:
                  image_input: Optional[str] = None,
                  audio_input: Optional[str] = None,
                  model_provider: str = "openai",
-                 max_questions: int = 5,
-                 max_features: int = 5):
+                 max_questions: Optional[int] = None,
+                 max_features: Optional[int] = None):
         self.config = {"configurable": {"thread_id": thread_id}}
         self.text_input = text_input
         self.image_input = image_input
         self.audio_input = audio_input
         self.model_provider = model_provider
+        
+        # Resolve limits from config if not provided
+        if max_questions is None:
+            max_questions = get_agent_limit("clarifier", "max_questions", 5)
+        if max_features is None:
+            max_features = get_agent_limit("product", "max_features", 5)
+            
         self.max_questions = max_questions
         self.max_features = max_features
         
@@ -175,69 +183,41 @@ class ProductConversationManager:
             return False
 
         # Initial invocation
-        product_result = self.product_agent.invoke({"messages": self.clarifier_messages}, self.config)
+        trigger_message = HumanMessage(content=f"Based on the gathered requirements, please generate the full product specification with at least {self.max_features} features.")
+        product_result = self.product_agent.invoke({"messages": self.clarifier_messages + [trigger_message]}, self.config)
         self.product_messages = product_result.get("messages", [])
         if not self.product_messages:
             print("Error: Product agent returned no messages")
             return False
 
         product_response = self.product_messages[-1].content
+        usage_metadata = self.product_messages[-1].response_metadata.get("token_usage") if hasattr(self.product_messages[-1], "response_metadata") else None
+        
+        from src.utils.token_tracker import token_tracker
+        if usage_metadata:
+            token_tracker.track_usage(usage_metadata)
+            
         print(f"\nProduct Response: {product_response}")
 
-        # Try to parse the response as ProductResp
+        # Try to parse the response using TOON
         try:
-            product_obj = process_agent_response(product_response, ProductResp)
+            from src.utils import toon
+            # Try TOON parsing first since product agent outputs TOON
+            parsed = toon.parse_response(product_response)
+            if not parsed:
+                # Fallback to JSON
+                parsed = json.loads(product_response)
+            
+            # Convert to ProductResp object
+            product_obj = ProductResp(
+                name=parsed.get("name", "Unknown Product"),
+                description=parsed.get("description", "No description available"),
+                features=parsed.get("features", [])
+            )
         except Exception as e:
             print(f"Error processing response: {e}")
-            # If parsing fails, try to extract JSON from the response
-            try:
-                # Look for JSON in the response
-                json_start = product_response.find('{')
-                json_end = product_response.rfind('}') + 1
-                if json_start >= 0 and json_end > json_start:
-                    json_str = product_response[json_start:json_end]
-                    product_data = json.loads(json_str)
-                    # Create a ProductResp object from the extracted data
-                    product_obj = ProductResp(
-                        name=product_data.get("name", "Unknown Product"),
-                        description=product_data.get("description", "No description available"),
-                        features=product_data.get("features", [])
-                    )
-                else:
-                    raise ValueError("No JSON found in response")
-            except Exception as e2:
-                print(f"Error extracting JSON: {e2}")
-                print("\nRetrying with more explicit instructions...")
-                # Retry with even more explicit instructions
-                retry_message = HumanMessage(
-                    content="Please generate a product response in valid JSON format with these exact fields:\n"
-                    "{\n"
-                    '  "name": "Product Name",\n'
-                    '  "description": "Detailed product description",\n'
-                    '  "features": [\n'
-                    '    {"name": "Feature 1", "description": "Description of feature 1"},\n'
-                    '    {"name": "Feature 2", "description": "Description of feature 2"},\n'
-                    '    ...\n'
-                    '  ]\n'
-                    "}\n\n"
-                    "Make sure to include at least 5 features. Do not include any questions or other text."
-                )
-                product_result = self.product_agent.invoke(
-                    {"messages": self.product_messages + [retry_message]},
-                    self.config
-                )
-                self.product_messages = product_result.get("messages", [])
-                if not self.product_messages:
-                    print("Error: Product agent retry returned no messages")
-                    return False
-                product_response = self.product_messages[-1].content
-                print(f"\nProduct Response (retry): {product_response}")
-                try:
-                    product_obj = process_agent_response(product_response, ProductResp)
-                except Exception as e3:
-                    print(f"Error in retry: {e3}")
-                    print("\nError: Could not parse product response after retry.")
-                    return False
+            print("\nError: Could not parse product response.")
+            return False
 
         if product_obj:
             self.final_data["product"] = product_obj.model_dump()
@@ -265,11 +245,11 @@ class ProductConversationManager:
                 # Create a new features list with at least 5 features
                 base_features = product_obj.features.copy()
                 additional_features = [
-                    {"name": "User Profiles", "description": "Create and customize personal user profiles with avatars and preferences."},
-                    {"name": "Social Sharing", "description": "Share achievements and progress on social media platforms."},
-                    {"name": "Progress Tracking", "description": "Visualize progress with charts and graphs over time."},
-                    {"name": "Goal Setting", "description": "Set and track personal fitness goals with reminders."},
-                    {"name": "Health Insights", "description": "Receive personalized health insights based on tracked data."}
+                    {"name": "User Profiles", "reason": "Personalization", "goal_oriented": 0.7, "development_time": "1 week", "cost_estimate": 2000.0},
+                    {"name": "Social Sharing", "reason": "Engagement", "goal_oriented": 0.6, "development_time": "1 week", "cost_estimate": 1500.0},
+                    {"name": "Progress Tracking", "reason": "Motivation", "goal_oriented": 0.9, "development_time": "2 weeks", "cost_estimate": 3000.0},
+                    {"name": "Goal Setting", "reason": "User retention", "goal_oriented": 0.8, "development_time": "1 week", "cost_estimate": 2500.0},
+                    {"name": "Health Insights", "reason": "Value addition", "goal_oriented": 0.7, "development_time": "2 weeks", "cost_estimate": 4000.0}
                 ]
 
                 # Add additional features until we have at least 5
@@ -294,17 +274,34 @@ class ProductConversationManager:
             return False
 
         product_response = self.product_messages[-1].content
-        customer_result = self.customer_runner(product_response)
-        if not customer_result:
+        customer_result = self.customer_runner.invoke(
+            {"messages": [HumanMessage(content=product_response)]},
+            self.config
+        )
+        if not customer_result or not customer_result.get("messages"):
             print("Error: Customer agent returned no result")
             return False
+            
+        customer_response = customer_result["messages"][-1].content
+        usage_metadata = customer_result["messages"][-1].response_metadata.get("token_usage") if hasattr(customer_result["messages"][-1], "response_metadata") else None
+        
+        from src.utils.token_tracker import token_tracker
+        if usage_metadata:
+            token_tracker.track_usage(usage_metadata)
 
         try:
-            self.final_data["customer"] = json.loads(customer_result)
-            print(customer_result)
+            from src.utils import toon
+            # Try TOON parsing first since customer agent outputs TOON
+            parsed = toon.parse_response(customer_response)
+            if not parsed:
+                # Fallback to JSON
+                parsed = json.loads(customer_response)
+                
+            self.final_data["customer"] = parsed
+            print(json.dumps(parsed, indent=2))
             return True
-        except json.JSONDecodeError:
-            print("Error: Failed to parse customer response as JSON")
+        except Exception as e:
+            print(f"Error: Failed to parse customer response: {e}")
             return False
 
     def run_engineer_agent(self) -> bool:

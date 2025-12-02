@@ -4,9 +4,9 @@ from pydantic import BaseModel, Field
 class ProductReqFeature(BaseModel):
     name: str
     reason: str
-    goal_oriented: float
+    goal_oriented: Any
     development_time: str
-    cost_estimate: float
+    cost_estimate: Any
 
 class ProductResp(BaseModel):
     name: str

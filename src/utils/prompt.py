@@ -212,21 +212,16 @@ Your workflow:
    - Includes relevant design elements from images
    - Incorporates specific details from audio and text
    - Is structured logically for easy understanding
-Your response must be a valid JSON object with this structure:
-{
-  "prompt": "The generated comprehensive prompt text here."
-}
-Important:
-- Respond with ONLY the JSON object, no other text
-- Ensure the JSON is valid and properly formatted
-- Combine information from all input types into a cohesive prompt
-- Prioritize requirements that appear in multiple sources
-- Include specific details mentioned in any input
+
+Provide your final output as a comprehensive prompt text. Do not wrap it in JSON.
+Just provide the text directly as your Final Answer.
+Combine information from all input types into a cohesive prompt.
+Prioritize requirements that appear in multiple sources.
+Include specific details mentioned in any input.
 """,
         checkpointer=memory,
         name="PromptGenerator",
     )
-
 # Backward compatibility
 try:
     from src.config.model_config import default_model

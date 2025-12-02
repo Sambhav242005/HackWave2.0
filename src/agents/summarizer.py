@@ -20,12 +20,21 @@ Instructions:
 - Highlight agreements, conflicts, trade-offs, and dependencies directly in the summary.
 - Ensure the final text reads naturally, like one thoughtful report, not a stitched list.
 - Prioritize clarity, conciseness, and completeness.
+- Structure the output with clear Markdown headers for:
+    1. Executive Summary
+    2. Market Analysis & Customer Insights
+    3. Technical Feasibility & Architecture
+    4. Risk Assessment & Mitigation
+    5. Conclusion & Next Steps
+- Use bullet points where appropriate for readability.
 
 Output format:
-Your response must be in TOON (Token-Oriented Object Notation) format:
+Your response must be in JSON format:
 
-```toon
-summary: The integrated summary text...
+```json
+{
+    "summary": "The integrated summary text..."
+}
 ```
 
 Input: {input}
@@ -34,6 +43,8 @@ Input: {input}
 # --- Create summarization agent ---
 def get_summarizer_agent(model):
     max_tokens = get_agent_limit("summarizer", "max_tokens", 1000)
+    # Bind the limit to the model
+    # Bind the limit to the model
     # Bind the limit to the model
     if max_tokens:
         model = model.bind(max_tokens=max_tokens)

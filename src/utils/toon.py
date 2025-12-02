@@ -16,6 +16,7 @@ def loads(text: str) -> dict:
     
     current_list_key = None
     current_list_headers = []
+    current_list_delimiter = ','
     current_list = []
     in_list_mode = False
     
@@ -32,14 +33,20 @@ def loads(text: str) -> dict:
             # Check if we are still in the list block (indentation check)
             if indent <= stack[-1][1]:
                 # End of list
-                stack[-1][0][current_list_key] = current_list
+                target_dict = stack[-1][0]
+                # Fix: If the key exists in the parent (meaning the current dict was a placeholder),
+                # assign the list to the parent instead.
+                if len(stack) > 1 and current_list_key in stack[-2][0]:
+                    target_dict = stack[-2][0]
+                
+                target_dict[current_list_key] = current_list
                 in_list_mode = False
                 current_list_key = None
                 current_list = []
                 current_list_headers = []
             else:
                 # Process list item
-                values = [v.strip() for v in content.split(',')]
+                values = [v.strip() for v in content.split(current_list_delimiter)]
                 item = {}
                 for i, header in enumerate(current_list_headers):
                     if i < len(values):
@@ -63,6 +70,47 @@ def loads(text: str) -> dict:
             
         current_dict = stack[-1][0]
         
+        # Check for simple list item "- value"
+        if content.startswith('- '):
+            value = content[2:].strip()
+            # print(f"DEBUG: Found list item '{value}' at indent {indent}")
+            
+            # Check if we need to convert an empty dict to a list
+            # This happens when we parsed "key:" (creating a dict) and now see "- value"
+            container = current_dict
+            
+            # If container is an empty dict, we might need to convert it
+            if isinstance(container, dict) and not container and len(stack) > 1:
+                 parent = stack[-2][0]
+                 # Find the key in parent that points to this container
+                 key_pointing_to_current = None
+                 for k, v in parent.items():
+                    if v is container:
+                        key_pointing_to_current = k
+                        break
+                 
+                 if key_pointing_to_current:
+                    # print(f"DEBUG: Converting key '{key_pointing_to_current}' to list")
+                    new_list = []
+                    parent[key_pointing_to_current] = new_list
+                    
+                    # CRITICAL: Update the stack to point to the new list
+                    # Stack items are tuples (obj, indent), so we need to replace the tuple
+                    stack[-1] = (new_list, stack[-1][1])
+                    
+                    # Update our local reference
+                    container = new_list
+
+            if isinstance(container, list):
+                container.append(value)
+                # print(f"DEBUG: Appended '{value}' to list")
+            else:
+                # Fallback: if we are in a dict and it's not empty, maybe it's a mixed content?
+                # For now, let's assume valid TOON doesn't mix dict keys and list items in same block.
+                pass
+                
+            continue
+
         # Check for key: value
         if ':' in content:
             key, value = content.split(':', 1)
@@ -71,15 +119,11 @@ def loads(text: str) -> dict:
             
             if not value:
                 # It's a nested object or a list start
-                # We need to peek ahead or assume based on context. 
-                # For TOON, we'll assume if the next line is a header (no colon), it's a list.
-                # But simpler: let's treat empty value as start of block.
-                
-                # We don't know if it's a dict or list yet. 
-                # Let's assume dict for now, and switch to list if we see headers.
                 new_obj = {}
                 current_dict[key] = new_obj
                 stack.append((new_obj, indent))
+            elif value == '[]':
+                current_dict[key] = []
             else:
                 # Simple key-value
                 # Try to convert types
@@ -95,7 +139,7 @@ def loads(text: str) -> dict:
         else:
             # No colon, likely a list header or list item if we were in a list
             # If we just started a block (previous line was key:), this might be headers
-            if stack[-1][0] == {}: # Empty dict we just created
+            if isinstance(stack[-1][0], dict) and not stack[-1][0]: # Empty dict we just created
                 # Convert that empty dict to a list placeholder
                 # We need to find the key for this... it's a bit tricky with the stack.
                 # Let's actually look at the parent
@@ -110,7 +154,14 @@ def loads(text: str) -> dict:
                 
                 if key_for_this:
                     current_list_key = key_for_this
-                    current_list_headers = [h.strip() for h in content.split(',')]
+                    
+                    # Detect delimiter
+                    if '|' in content:
+                        current_list_delimiter = '|'
+                    else:
+                        current_list_delimiter = ','
+                        
+                    current_list_headers = [h.strip() for h in content.split(current_list_delimiter)]
                     current_list = []
                     in_list_mode = True
                     # Remove the empty dict from parent
@@ -119,7 +170,10 @@ def loads(text: str) -> dict:
     
     # Cleanup if ended in list mode
     if in_list_mode and current_list_key:
-         stack[-1][0][current_list_key] = current_list
+         target_dict = stack[-1][0]
+         if len(stack) > 1 and current_list_key in stack[-2][0]:
+             target_dict = stack[-2][0]
+         target_dict[current_list_key] = current_list
 
     return result
 
@@ -160,17 +214,35 @@ def dumps(data: dict, indent: int = 0) -> str:
 def parse_response(text: str) -> dict:
     """
     Extracts and parses TOON content from an LLM response.
+    Handles TOON blocks, JSON blocks, raw JSON, and raw TOON.
     """
-    # Look for code blocks first
+    if not text or not text.strip():
+        return {}
+
+    # 1. Look for TOON code blocks
     match = re.search(r"```toon\n(.*?)\n```", text, re.DOTALL)
     if match:
-        return loads(match.group(1))
-        
-    # Fallback: try to parse the whole text or look for the first key-value
-    # This is a simplified heuristic
+        try:
+            return loads(match.group(1))
+        except Exception:
+            pass # Fallthrough
+
+    # 2. Look for JSON code blocks
+    match = re.search(r"```json\n(.*?)\n```", text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(1))
+        except Exception:
+            pass # Fallthrough
+
+    # 3. Try parsing as raw JSON
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    # 4. Fallback: try to parse as TOON
     try:
         return loads(text)
     except Exception:
-        # If direct parsing fails, maybe it's wrapped in something else?
-        # For now return empty or raise
         return {}

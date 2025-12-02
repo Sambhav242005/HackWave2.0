@@ -3,26 +3,26 @@ from typing import Dict, Any
 # Default limits for agents
 AGENT_LIMITS: Dict[str, Any] = {
     "clarifier": {
-        "max_questions": 5,
-        "max_tokens": 1000
+        "max_questions": 2,
+        "max_tokens": 5000
     },
     "product": {
-        "max_features": 5,
-        "max_tokens": 1500
+        "max_features": 2,
+        "max_tokens": 5000
     },
     "customer": {
-        "max_results": 5,
-        "max_tokens": 2000,
-        "min_features": 3
+        "max_results": 2,
+        "max_tokens": 5000,
+        "min_features": 2
     },
     "engineer": {
-        "max_tokens": 2000
+        "max_tokens": 5000
     },
     "risk": {
-        "max_tokens": 2000
+        "max_tokens": 5000
     },
     "summarizer": {
-        "max_tokens": 1000
+        "max_tokens": 3000
     }
 }
 

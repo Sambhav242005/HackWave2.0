@@ -23,28 +23,28 @@ Your response must be in TOON (Token-Oriented Object Notation) format:
 done: false
 summary: Overall risk assessment summary
 recommendations:
-  Rec 1, Rec 2
+  Rec 1 | Rec 2
 features:
-  feature, law_interaction, is_potential_risk, potential_risk, border_line_thing, gdpr_compliance, data_retention, user_consent, risk_level, mitigation
-  Feature 1, Interaction, true, Risk desc, Borderline, GDPR, Retention, Consent, high, Mitigation
+  feature | law_interaction | is_potential_risk | potential_risk | border_line_thing | gdpr_compliance | data_retention | user_consent | risk_level | mitigation
+  Feature 1 | Interaction | true | Risk desc | Borderline | GDPR | Retention | Consent | high | Mitigation
 ```
 
 Important Guidelines:
 - Respond with ONLY the TOON data
 - Use the exact format shown above
+- ALWAYS include the header line "feature | law_interaction | is_potential_risk | potential_risk | border_line_thing | gdpr_compliance | data_retention | user_consent | risk_level | mitigation" before the list of features
 - Each round, analyze at least one new feature
 - After analyzing all features, set "done" to true
-- Focus specifically on:
-  * GDPR compliance (data minimization, purpose limitation, consent)
-  * User privacy implications
-  * Data security requirements
-  * Cross-border data transfer issues
-  * User rights (access, rectification, deletion)
-  * Data retention policies
-  * Third-party data sharing risks
+- Focus specifically on identifying APPLICABLE LAWS:
+  * GDPR (General Data Protection Regulation)
+  * HIPAA (Health Insurance Portability and Accountability Act)
+  * CCPA (California Consumer Privacy Act)
+  * DPDPA (Digital Personal Data Protection Act)
+  * SOX (Sarbanes-Oxley Act)
+  * COPPA (Children's Online Privacy Protection Act)
+- In the 'law_interaction' column, EXPLICITLY name the law (e.g., "GDPR", "HIPAA", "DPDPA") or "None" if no specific law applies.
 - For each feature, provide concrete examples of potential violations
 - Suggest specific technical and procedural controls for compliance
-- Consider both current regulations and emerging legal trends
 - Highlight features that require legal consultation before implementation
 
 Current features: {current_features}

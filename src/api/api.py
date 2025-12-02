@@ -1,1071 +1,337 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import json
 import uuid
-import time
 from typing import Dict, Any, List, Optional
-from langchain_core.messages import HumanMessage
-from src.agents.agent import get_clarifier_agent, get_product_agent
+from langchain_core.messages import HumanMessage, AIMessage
+from src.agents.agent import get_clarifier_agent, get_product_agent, get_classifier_agent
 from src.models.agentComp import ClarifierResp, ProductResp, EngineerAnalysis, RiskAssessment, CustomerAnalysis, SummarizerOutput
 from src.agents.engineer import get_engineer_agent
-from src.agents.customer import customer
+from src.agents.customer import get_customer_agent
 from src.agents.risk import get_risk_agent
-from src.agents.summarizer import get_summarizer_agent, compile_agent_reports
-from src.services.diagram.diagramAgent import generate_mermaid_link
+from src.agents.summarizer import get_summarizer_agent
 import src.utils.toon as toon
-
-# Auth imports
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from fastapi import Depends, status
-from datetime import timedelta
-from src.services.auth import User, UserInDB, Token, create_user, verify_user, create_access_token, get_user as get_user_db, ACCESS_TOKEN_EXPIRE_MINUTES
 from src.config.model_config import get_model
-from jose import JWTError, jwt
-from src.config.env import JWT_SECRET_KEY, ALGORITHM
 
 app = FastAPI(title="Product Conversation API")
 
-# Auth Scheme
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
-
-# In-memory storage for conversation states
-conversation_states: Dict[str, Dict[str, Any]] = {}
-
 # Pydantic models for request/response
-class TextInput(BaseModel):
-    text_input: str
-    image_input: Optional[str] = None
-    audio_input: Optional[str] = None
-    model_provider: Optional[str] = "groq" # Default to groq
+class ClarifierRequest(BaseModel):
+    messages: List[Dict[str, str]]
+    model_provider: Optional[str] = "openai"
 
-class StartConversationRequest(TextInput):
-    pass
+class ClassifierRequest(BaseModel):
+    idea: str
+    model_provider: Optional[str] = "openai"
 
-class UserSignup(BaseModel):
-    username: str
-    password: str
-    email: Optional[str] = None
-    full_name: Optional[str] = None
+class ProductRequest(BaseModel):
+    requirements: str
+    model_provider: Optional[str] = "openai"
 
-class ContinueClarifierRequest(BaseModel):
-    thread_id: str
-    answers: List[str]
+class CustomerRequest(BaseModel):
+    product_data: Dict[str, Any]
+    model_provider: Optional[str] = "openai"
 
-class RunWorkflowRequest(BaseModel):
-    thread_id: str
+class EngineerRequest(BaseModel):
+    customer_data: Dict[str, Any]
+    model_provider: Optional[str] = "openai"
 
-class RunWorkflowStreamRequest(TextInput):
-    pass
+class RiskRequest(BaseModel):
+    engineer_data: Dict[str, Any]
+    model_provider: Optional[str] = "openai"
 
-# Helper functions
-def generate_thread_id() -> str:
-    return str(uuid.uuid4())
+class SummaryRequest(BaseModel):
+    final_data: Dict[str, Any]
+    model_provider: Optional[str] = "openai"
 
-def get_conversation_state(thread_id: str) -> Dict[str, Any]:
-    if thread_id not in conversation_states:
-        raise HTTPException(status_code=404, detail="Thread not found")
-    return conversation_states[thread_id]
+class DiagramRequest(BaseModel):
+    project_summary: Dict[str, Any]  # Can be product data or full project summary
 
-def update_conversation_state(thread_id: str, state: Dict[str, Any]) -> None:
-    conversation_states[thread_id] = state
+# Helper function
+def safe_parse(response: str) -> Dict[str, Any]:
+    """Safely parse response string as TOON or JSON"""
+    try:
+        data = toon.parse_response(response)
+        if not data:
+            data = json.loads(response)
+        return data
+    except Exception:
+        # If parsing fails, return the raw text wrapped in a dict
+        return {"raw_content": response, "error": "Failed to parse response"}
 
-# Helper function from working code
 def process_agent_response(response: str, response_model):
-    """Process agent response and parse into the given model using TOON"""
+    """Process agent response and parse into the given model using JSON"""
     try:
         # Parse TOON
-        data = toon.parse_response(response)
-        
-        # Handle potential structure mismatches if any
-        # For ClarifierResp, we expect 'resp' list. TOON parser returns dict.
-        # For ProductResp, we expect 'features' list.
+        if isinstance(response, str):
+            data = safe_parse(response)
+        else:
+            data = response
         
         return response_model(**data)
     except Exception as e:
-        print(f"Error parsing TOON: {e}")
+        print(f"Error parsing JSON: {e}")
         return None
 
-# Auth Dependency
-async def get_current_user(token: str = Depends(oauth2_scheme)):
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Could not validate credentials",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
-    try:
-        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[ALGORITHM])
-        username: str = payload.get("sub")
-        if username is None:
-            raise credentials_exception
-    except JWTError:
-        raise credentials_exception
-    user = get_user_db(username)
-    if user is None:
-        raise credentials_exception
-    return user
-
 # API Endpoints
-@app.post("/signup", response_model=Token)
-async def signup(user: UserSignup):
-    user_in = User(username=user.username, email=user.email, full_name=user.full_name)
-    if not create_user(user_in, user.password):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Username already registered"
-        )
-    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    access_token = create_access_token(
-        data={"sub": user.username}, expires_delta=access_token_expires
-    )
-    return {"access_token": access_token, "token_type": "bearer"}
-
-@app.post("/token", response_model=Token)
-async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
-    user = get_user_db(form_data.username)
-    if not user or not verify_user(form_data.password, user.hashed_password):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect username or password",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    access_token = create_access_token(
-        data={"sub": user.username}, expires_delta=access_token_expires
-    )
-    return {"access_token": access_token, "token_type": "bearer"}
 @app.get("/")
 async def health_check():
     return {"status": "healthy"}
 
-@app.post("/start_conversation")
-async def start_conversation(request: StartConversationRequest, current_user: User = Depends(get_current_user)):
-    """Start a new clarifier conversation"""
-    thread_id = generate_thread_id()
-    config = {"configurable": {"thread_id": thread_id}}
-
-    # Initialize the state
-    state = {
-        "thread_id": thread_id,
-        "username": current_user.username,
-        "model_provider": request.model_provider,
-        "text_input": request.text_input,
-        "image_input": request.image_input,
-        "audio_input": request.audio_input,
-        "clarifier_done": False,
-        "current_round": 0,
-        "workflow_done": False,
-        "messages": [],
-        "final_data": {},
-        "config": config
-    }
-
-    # Get model and agent
+@app.post("/clarify")
+async def clarify(request: ClarifierRequest):
+    """Run Clarifier agent step"""
     try:
         model = get_model(provider=request.model_provider)
         clarifier = get_clarifier_agent(model)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        
+        # Convert dict messages to LangChain messages
+        lc_messages = []
+        for msg in request.messages:
+            if msg["role"] == "user":
+                lc_messages.append(HumanMessage(content=msg["content"]))
+            elif msg["role"] == "assistant":
+                lc_messages.append(AIMessage(content=msg["content"]))
+        
+        # If no messages, start with default prompt (though client should handle this)
+        if not lc_messages:
+             return {"error": "No messages provided"}
 
-    # Start clarifier conversation
-    initial_message = HumanMessage(
-        content=f"Start gathering requirements for a new product based on: {request.text_input}. Only ask 3-5 critical questions that require user input."
-    )
-
-    clarifier_result = clarifier.invoke({"messages": [initial_message]}, config)
-    clarifier_messages = clarifier_result["messages"]
-    clarifier_response = clarifier_messages[-1].content
-
-    # Process clarifier response
-    clarifier_obj = process_agent_response(clarifier_response, ClarifierResp)
-    if clarifier_obj:
-        state["final_data"]["clarifier"] = clarifier_obj.model_dump()
-        state["clarifier_done"] = clarifier_obj.done
-        state["current_round"] = 1
-        state["messages"] = clarifier_messages
-
-        # Add clarifier response to messages
-        state["messages"].append({
-            "role": "assistant",
-            "content": toon.dumps({
-                "resp": [q.dict() for q in clarifier_obj.resp],
-                "done": clarifier_obj.done
-            })
-        })
-
-    update_conversation_state(thread_id, state)
-
-    return {
-        "session_id": thread_id,
-        "clarifier_questions": [q.dict() for q in clarifier_obj.resp],
-        "status": "success"
-    }
-
-@app.post("/continue_clarifier")
-async def continue_clarifier(request: ContinueClarifierRequest, current_user: User = Depends(get_current_user)):
-    """Continue the clarifier conversation with user answers"""
-    state = get_conversation_state(request.thread_id)
-    
-    # Verify ownership
-    if state.get("username") != current_user.username:
-        raise HTTPException(status_code=403, detail="Not authorized to access this conversation")
-
-    config = state["config"]
-
-    if state.get("clarifier_done", False):
-        return {
-            "session_id": request.thread_id,
-            "clarifier_questions": [],
-            "status": "clarification_complete"
+        config = {"configurable": {"thread_id": str(uuid.uuid4())}} # Dummy thread ID for LangGraph
+        clarifier_result = clarifier.invoke({"messages": lc_messages}, config)
+        clarifier_messages = clarifier_result["messages"]
+        clarifier_response = clarifier_messages[-1].content
+        
+        # Parse response
+        print(f"DEBUG: Clarifier Raw Response: {clarifier_response}")
+        clarifier_obj = process_agent_response(clarifier_response, ClarifierResp)
+        print(f"DEBUG: Clarifier Parsed Object: {clarifier_obj}")
+        
+        response_data = {
+            "response": clarifier_response,
+            "parsed": clarifier_obj.model_dump() if clarifier_obj else None,
+            "done": clarifier_obj.done if clarifier_obj else False
         }
-
-    try:
-        # Get model and agent
-        model = get_model(provider=state.get("model_provider", "groq"))
-        clarifier = get_clarifier_agent(model)
-
-        # Get the last clarifier message
-        last_message = state["messages"][-1]
-        clarifier_data = toon.loads(last_message["content"])
-
-        # Update with user answers
-        if "resp" in clarifier_data:
-            questions = clarifier_data["resp"]
-            for i, question in enumerate(questions):
-                if i < len(request.answers) and not question.get("answer"):
-                    question["answer"] = request.answers[i]
-                    # Add user answer to messages
-                    state["messages"].append(
-                        HumanMessage(content=f"User answered: '{question['question']}' -> '{request.answers[i]}'")
-                    )
-
-            # Continue clarifier conversation
-            clarifier_result = clarifier.invoke({"messages": state["messages"]}, config)
-            clarifier_messages = clarifier_result["messages"]
-            clarifier_response = clarifier_messages[-1].content
-
-            # Process clarifier response
-            clarifier_obj = process_agent_response(clarifier_response, ClarifierResp)
-            if clarifier_obj:
-                state["final_data"]["clarifier"] = clarifier_obj.model_dump()
-                state["clarifier_done"] = clarifier_obj.done
-                state["current_round"] += 1
-                state["messages"] = clarifier_messages
-
-                # Add clarifier response to messages
-                state["messages"].append({
-                    "role": "assistant",
-                    "content": toon.dumps({
-                        "resp": [q.dict() for q in clarifier_obj.resp],
-                        "done": clarifier_obj.done
-                    })
-                })
-
-        update_conversation_state(request.thread_id, state)
-
-        if state.get("clarifier_done", False):
-            return {
-                "session_id": request.thread_id,
-                "clarifier_questions": [],
-                "status": "clarification_complete"
-            }
-        else:
-            return {
-                "session_id": request.thread_id,
-                "clarifier_questions": [q.dict() for q in clarifier_obj.resp],
-                "status": "continue"
-            }
+        
+        return response_data
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error continuing clarifier: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error in clarifier: {str(e)}")
 
-@app.get("/get_state/{thread_id}")
-async def get_state(thread_id: str, current_user: User = Depends(get_current_user)):
-    """Get the current state of the conversation"""
-    state = get_conversation_state(thread_id)
-
-    # Verify ownership
-    if state.get("username") != current_user.username:
-        raise HTTPException(status_code=403, detail="Not authorized to access this conversation")
-
-    response_state = {
-        "session_id": thread_id,
-        "state": state["final_data"],
-        "clarifier_done": state.get("clarifier_done", False),
-        "current_round": state.get("current_round", 0)
-    }
-
-    return response_state
-
-@app.post("/run_workflow")
-async def run_workflow(request: RunWorkflowRequest, current_user: User = Depends(get_current_user)):
-    """Run the workflow for a given thread_id"""
-    state = get_conversation_state(request.thread_id)
-    
-    # Verify ownership
-    if state.get("username") != current_user.username:
-        raise HTTPException(status_code=403, detail="Not authorized to access this conversation")
-
-    config = state["config"]
-
-    # Check if clarifier is done
-    if not state.get("clarifier_done", False):
-        raise HTTPException(status_code=400, detail="Clarifier conversation not completed")
-
-    # Run the workflow in the background
-    background_tasks = BackgroundTasks()
-    background_tasks.add_task(run_workflow_background, request.thread_id, config)
-
-    return {
-        "status": "workflow_started",
-        "session_id": request.thread_id
-    }
-
-async def run_workflow_background(thread_id: str, config: dict):
-    """Run the workflow in the background"""
-    state = get_conversation_state(thread_id)
-
+@app.post("/classify")
+async def classify(request: ClassifierRequest):
+    """Run Classifier agent step"""
     try:
-        # Get model and agents
-        model_provider = state.get("model_provider", "groq")
-        model = get_model(provider=model_provider)
+        model = get_model(provider=request.model_provider)
+        classifier = get_classifier_agent(model)
         
-        product_agent = get_product_agent(model)
-        customer_agent = customer # Customer is a function, but we need to pass model to it? No, customer.py was refactored to get_customer_agent(model) which returns a runnable/function.
-        # Wait, customer.py: get_customer_agent(model) returns a function `customer_agent(product_spec)`.
-        # So I should call get_customer_agent(model).
-        customer_func = customer # This is the old import. I need to use the factory.
-        # I imported `customer` from `src.agents.customer`. 
-        # Let's check `src/agents/customer.py` again.
-        # It defines `get_customer_agent(model)`.
-        # I should have imported `get_customer_agent`.
-        # In Chunk 1, I imported `customer`. I should fix that import or just use `get_customer_agent` if I imported it.
-        # I'll assume I need to fix the import or use what I have.
-        # Actually, I'll fix the import in this chunk too if possible, or just use `src.agents.customer.get_customer_agent`.
+        config = {"configurable": {"thread_id": str(uuid.uuid4())}}
         
-        engineer_agent = get_engineer_agent(model)
-        risk_agent = get_risk_agent(model)
-        summarizer = get_summarizer_agent(model)
+        classifier_result = classifier.invoke(
+            {"messages": [HumanMessage(content=f"Idea: {request.idea}")]},
+            config
+        )
+        classifier_response = classifier_result["messages"][-1].content
+        
+        # Parse TOON
+        classifier_data = safe_parse(classifier_response)
+        
+        return {
+            "classification": classifier_data,
+            "raw_response": classifier_response
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error in classifier: {str(e)}")
 
-        # Run product agent
-        product_result = product_agent.invoke({"messages": state["messages"]}, config)
-        product_messages = product_result["messages"]
-        product_response = product_messages[-1].content
+from src.services.diagram.diagram import generate_mermaid_link
+
+@app.post("/generate_product")
+async def generate_product(request: ProductRequest):
+    """Generate product data from requirements"""
+    try:
+        model = get_model(provider=request.model_provider)
+        product_agent = get_product_agent(model)
+        
+        trigger_message = HumanMessage(content=f"Requirements: {request.requirements}\\n\\nBased on the above requirements, please generate the full product specification.")
+        config = {"configurable": {"thread_id": str(uuid.uuid4())}}
+        
+        product_result = product_agent.invoke({"messages": [trigger_message]}, config)
+        product_response = product_result["messages"][-1].content
         product_obj = process_agent_response(product_response, ProductResp)
 
         if product_obj:
-            state["final_data"]["product"] = product_obj.model_dump()
             # Ensure at least 5 features
             if len(product_obj.features) < 5:
                 retry_message = HumanMessage(content="Generate a product response with at least 5 features based on our conversation.")
-                product_result = product_agent.invoke({"messages": product_messages + [retry_message]}, config)
-                product_messages = product_result["messages"]
-                product_response = product_messages[-1].content
+                product_result = product_agent.invoke({"messages": [trigger_message, AIMessage(content=product_response), retry_message]}, config)
+                product_response = product_result["messages"][-1].content
                 product_obj = process_agent_response(product_response, ProductResp)
-                if product_obj:
-                    state["final_data"]["product"] = product_obj.model_dump()
 
-        # Run customer agent
-        # The refactored customer agent is a function returned by get_customer_agent(model)
-        # But I need to import get_customer_agent.
-        # I will use dynamic import or fix imports at top of file.
-        from src.agents.customer import get_customer_agent
-        customer_runner = get_customer_agent(model)
-        customer_result = customer_runner(product_response)
+            # Generate diagram
+            try:
+                diagram_url = generate_mermaid_link(product_obj.model_dump_json())
+            except Exception as e:
+                print(f"Diagram generation failed: {e}")
+                diagram_url = None
+            
+            return {
+                "product_data": product_obj.model_dump() if product_obj else None,
+                "diagram_url": diagram_url,
+                "raw_response": product_response
+            }
+        else:
+            print(f"Failed to parse product response: {product_response}")
+            raise HTTPException(status_code=500, detail=f"Failed to parse product data. Raw: {product_response[:500]}")
+    except Exception as e:
+        print(f"Exception in generate_product: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error generating product: {str(e)}")
+
+@app.post("/generate_customer")
+async def generate_customer(request: CustomerRequest):
+    """Generate customer analysis from product data"""
+    try:
+        model = get_model(provider=request.model_provider)
+        customer_agent = get_customer_agent(model)
         
-        try:
-            # customer_result is a JSON string. We can parse it into our Pydantic model to validate it.
-            customer_data = json.loads(customer_result)
-            customer_obj = CustomerAnalysis(**customer_data)
-            state["final_data"]["customer"] = customer_obj.model_dump()
-        except Exception as e:
-            print(f"Error validating customer data: {e}")
-            state["final_data"]["customer"] = json.loads(customer_result)
+        product_str = toon.dumps(request.product_data)
+        config = {"configurable": {"thread_id": str(uuid.uuid4())}}
+        
+        customer_result = customer_agent.invoke(
+            {"messages": [HumanMessage(content=product_str)]},
+            config
+        )
+        customer_response = customer_result["messages"][-1].content
+        
+        # Track tokens
+        from src.utils.token_tracker import token_tracker
+        usage_metadata = customer_result["messages"][-1].response_metadata.get("token_usage") if hasattr(customer_result["messages"][-1], "response_metadata") else None
+        if usage_metadata:
+            token_tracker.track_usage(usage_metadata)
 
-        # Run engineer agent
+        customer_data = safe_parse(customer_response)
+        
+        return {
+            "customer_data": customer_data,
+            "raw_response": customer_response
+        }
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error generating customer analysis: {str(e)}")
+
+@app.post("/generate_engineer")
+async def generate_engineer(request: EngineerRequest):
+    """Generate engineer analysis from customer data"""
+    try:
+        model = get_model(provider=request.model_provider)
+        engineer_agent = get_engineer_agent(model)
+        
+        customer_str = toon.dumps(request.customer_data)
+        config = {"configurable": {"thread_id": str(uuid.uuid4())}}
+        
         engineer_result = engineer_agent.invoke(
-            {"messages": [HumanMessage(content=toon.dumps(state["final_data"]["customer"]))],
-             "current_features": "None", "current_analysis": "None"}, 
+            {"messages": [HumanMessage(content=customer_str)]},
             config
         )
         engineer_response = engineer_result["messages"][-1].content
-        engineer_obj = process_agent_response(engineer_response, EngineerAnalysis)
-        if engineer_obj:
-            state["final_data"]["engineer"] = {"analysis": engineer_obj.model_dump()}
-        else:
-            # Fallback or error handling
-            state["final_data"]["engineer"] = {"analysis": toon.parse_response(engineer_response)}
+        
+        # Track tokens
+        from src.utils.token_tracker import token_tracker
+        usage_metadata = engineer_result["messages"][-1].response_metadata.get("token_usage") if hasattr(engineer_result["messages"][-1], "response_metadata") else None
+        if usage_metadata:
+            token_tracker.track_usage(usage_metadata)
 
-        # Run risk agent
+        engineer_data = safe_parse(engineer_response)
+
+        # Avoid double wrapping if 'analysis' key already exists
+        if isinstance(engineer_data, dict) and "analysis" in engineer_data:
+            final_data = engineer_data
+        else:
+            final_data = {"analysis": engineer_data}
+
+        return {
+            "engineer_data": final_data,
+            "raw_response": engineer_response
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error generating engineer analysis: {str(e)}")
+
+@app.post("/generate_risk")
+async def generate_risk(request: RiskRequest):
+    """Generate risk assessment from engineer data"""
+    try:
+        model = get_model(provider=request.model_provider)
+        risk_agent = get_risk_agent(model)
+        
+        engineer_data = request.engineer_data
+        engineer_analysis = engineer_data.get("analysis", engineer_data)
+        engineer_str = toon.dumps(engineer_analysis)
+        config = {"configurable": {"thread_id": str(uuid.uuid4())}}
+
         risk_result = risk_agent.invoke(
-            {"messages": [HumanMessage(content=engineer_response)]},
+            {"messages": [HumanMessage(content=engineer_str)]},
             config
         )
         risk_response = risk_result["messages"][-1].content
-        risk_obj = process_agent_response(risk_response, RiskAssessment)
-        if risk_obj:
-            state["final_data"]["risk"] = {"assessment": risk_obj.model_dump()}
-        else:
-            state["final_data"]["risk"] = {"assessment": toon.parse_response(risk_response)}
+        
+        # Track tokens
+        from src.utils.token_tracker import token_tracker
+        usage_metadata = risk_result["messages"][-1].response_metadata.get("token_usage") if hasattr(risk_result["messages"][-1], "response_metadata") else None
+        if usage_metadata:
+            token_tracker.track_usage(usage_metadata)
 
-        # Generate final summary
+        risk_data = safe_parse(risk_response)
+
+        return {
+            "risk_data": {"assessment": risk_data},
+            "raw_response": risk_response
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error generating risk assessment: {str(e)}")
+
+@app.post("/generate_summary")
+async def generate_summary(request: SummaryRequest):
+    """Generate final summary from all data"""
+    try:
+        model = get_model(provider=request.model_provider)
+        summarizer = get_summarizer_agent(model)
+        
+        config = {"configurable": {"thread_id": str(uuid.uuid4())}}
+        
         summary_result = summarizer.invoke(
-            {"messages": [HumanMessage(content=toon.dumps(state["final_data"], indent=2))]},
+            {"messages": [HumanMessage(content=toon.dumps(request.final_data, indent=2))]},
             config
         )
         summary_response = summary_result["messages"][-1].content
+        print(f"DEBUG: Raw Summary Response: {summary_response}")
+        
         summary_obj = process_agent_response(summary_response, SummarizerOutput)
         if summary_obj:
+            print(f"DEBUG: Parsed Summary Object: {summary_obj}")
             summary = summary_obj.summary
         else:
-            summary_data = toon.parse_response(summary_response)
+            print("DEBUG: Failed to parse summary object, falling back to safe_parse")
+            summary_data = safe_parse(summary_response)
             summary = summary_data.get("summary", summary_response)
-        state["final_data"]["summary"] = summary
-
-        # Update state to mark workflow as done
-        state["workflow_done"] = True
-        update_conversation_state(thread_id, state)
-    except Exception as e:
-        print(f"Error running workflow: {str(e)}")
-        state["workflow_error"] = str(e)
-        update_conversation_state(thread_id, state)
-
-@app.get("/get_result/{thread_id}")
-async def get_result(thread_id: str, current_user: User = Depends(get_current_user)):
-    """Get the final result of the workflow"""
-    state = get_conversation_state(thread_id)
-
-    # Verify ownership
-    if state.get("username") != current_user.username:
-        raise HTTPException(status_code=403, detail="Not authorized to access this conversation")
-
-    if not state.get("workflow_done", False):
-        if "workflow_error" in state:
-            raise HTTPException(status_code=500, detail=f"Workflow failed: {state['workflow_error']}")
-        raise HTTPException(status_code=404, detail="Workflow result not available yet")
-
-    # Return the final data
-    result = {
-        "session_id": thread_id,
-        "final_data": state["final_data"],
-        "summary": state["final_data"].get("summary", ""),
-        "tts_file": state["final_data"].get("tts_file", ""),
-        "status": "success"
-    }
-
-    return result
-
-@app.post("/run_workflow_stream")
-async def run_workflow_stream(request: RunWorkflowStreamRequest, current_user: User = Depends(get_current_user)):
-    """Run the entire workflow in one go and stream the results"""
-    thread_id = generate_thread_id()
-    config = {"configurable": {"thread_id": thread_id}}
-
-    # Initialize the state
-    state = {
-        "thread_id": thread_id,
-        "username": current_user.username,
-        "model_provider": request.model_provider,
-        "text_input": request.text_input,
-        "image_input": request.image_input,
-        "audio_input": request.audio_input,
-        "clarifier_done": True,
-        "current_round": 1,
-        "workflow_done": False,
-        "messages": [],
-        "final_data": {},
-        "config": config
-    }
-
-    update_conversation_state(thread_id, state)
-
-    async def generate_stream():
-        try:
-            # Step 1: Start
-            yield json.dumps({
-                "step": "start",
-                "status": "success",
-                "data": {
-                    "session_id": thread_id,
-                    "timestamp": time.time()
-                },
-                "session_id": thread_id,
-                "timestamp": time.time()
-            }) + "\n"
-
-            # Step 2: Run clarifier (simulated)
-            initial_message = HumanMessage(
-                content=f"Start gathering requirements for a new product based on: {request.text_input}. Only ask 3-5 critical questions that require user input."
-            )
             
-            # Get model and agents
-            model_provider = state.get("model_provider", "groq")
-            model = get_model(provider=model_provider)
-            
-            clarifier_agent = get_clarifier_agent(model)
-            product_agent = get_product_agent(model)
-            from src.agents.customer import get_customer_agent
-            customer_runner = get_customer_agent(model)
-            engineer_agent = get_engineer_agent(model)
-            risk_agent = get_risk_agent(model)
-            summarizer = get_summarizer_agent(model)
-
-            clarifier_result = clarifier_agent.invoke({"messages": [initial_message]}, config)
-            clarifier_messages = clarifier_result["messages"]
-            clarifier_response = clarifier_messages[-1].content
-
-            clarifier_obj = process_agent_response(clarifier_response, ClarifierResp)
-            if clarifier_obj:
-                state["final_data"]["clarifier"] = clarifier_obj.model_dump()
-                state["messages"] = clarifier_messages
-
-                # Simulate user answers for streaming
-                for q in clarifier_obj.resp:
-                    q.answer = f"Answer for: {q.question}"
-                    state["messages"].append(
-                        HumanMessage(content=f"User answered: '{q.question}' -> '{q.answer}'")
-                    )
-
-                # Continue clarifier until done
-                while not clarifier_obj.done:
-                    clarifier_result = clarifier_agent.invoke({"messages": state["messages"]}, config)
-                    clarifier_messages = clarifier_result["messages"]
-                    clarifier_response = clarifier_messages[-1].content
-                    clarifier_obj = process_agent_response(clarifier_response, ClarifierResp)
-
-                    if clarifier_obj:
-                        state["final_data"]["clarifier"] = clarifier_obj.model_dump()
-                        state["messages"] = clarifier_messages
-
-                        # Simulate user answers
-                        for q in clarifier_obj.resp:
-                            if not q.answer:
-                                q.answer = f"Answer for: {q.question}"
-                                state["messages"].append(
-                                    HumanMessage(content=f"User answered: '{q.question}' -> '{q.answer}'")
-                                )
-
-                yield json.dumps({
-                    "step": "clarifier",
-                    "status": "success",
-                    "data": state["final_data"]["clarifier"],
-                    "error": None,
-                    "session_id": thread_id,
-                    "timestamp": time.time()
-                }) + "\n"
-
-            # Step 3: Run product agent
-            product_result = product_agent.invoke({"messages": state["messages"]}, config)
-            product_messages = product_result["messages"]
-            product_response = product_messages[-1].content
-            product_obj = process_agent_response(product_response, ProductResp)
-
-            if product_obj:
-                state["final_data"]["product"] = product_obj.model_dump()
-                # Ensure at least 5 features
-                if len(product_obj.features) < 5:
-                    retry_message = HumanMessage(content="Generate a product response with at least 5 features based on our conversation.")
-                    product_result = product_agent.invoke({"messages": product_messages + [retry_message]}, config)
-                    product_messages = product_result["messages"]
-                    product_response = product_messages[-1].content
-                    product_obj = process_agent_response(product_response, ProductResp)
-                    if product_obj:
-                        state["final_data"]["product"] = product_obj.model_dump()
-
-                # Generate diagram (simulated)
-                diagram_url = "https://example.com/diagram.png"
-                state["final_data"]["diagram_url"] = diagram_url
-
-                yield json.dumps({
-                    "step": "product",
-                    "status": "success",
-                    "data": {
-                        "product": state["final_data"]["product"],
-                        "diagram_url": diagram_url
-                    },
-                    "error": None,
-                    "session_id": thread_id,
-                    "timestamp": time.time()
-                }) + "\n"
-
-            # Step 4: Run customer agent
-            customer_result = customer_runner(product_response)
-            state["final_data"]["customer"] = json.loads(customer_result)
-            yield json.dumps({
-                "step": "customer",
-                "status": "success",
-                "data": state["final_data"]["customer"],
-                "error": None,
-                "session_id": thread_id,
-                "timestamp": time.time()
-            }) + "\n"
-
-            # Step 5: Run engineer agent
-            engineer_result = engineer_agent.invoke(
-                {"messages": [HumanMessage(content=json.dumps(state["final_data"]["customer"]))]},
-                config
-            )
-            engineer_response = engineer_result["messages"][-1].content
-            state["final_data"]["engineer"] = {"analysis": json.loads(engineer_response)}
-            yield json.dumps({
-                "step": "engineer",
-                "status": "success",
-                "data": state["final_data"]["engineer"],
-                "error": None,
-                "session_id": thread_id,
-                "timestamp": time.time()
-            }) + "\n"
-
-            # Step 6: Run risk agent
-            risk_result = risk_agent.invoke(
-                {"messages": [HumanMessage(content=engineer_response)]},
-                config
-            )
-            risk_response = risk_result["messages"][-1].content
-            state["final_data"]["risk"] = {"assessment": json.loads(risk_response)}
-            yield json.dumps({
-                "step": "risk",
-                "status": "success",
-                "data": state["final_data"]["risk"],
-                "error": None,
-                "session_id": thread_id,
-                "timestamp": time.time()
-            }) + "\n"
-
-            # Step 7: Generate summary
-            summary_result = summarizer.invoke(
-                {"messages": [HumanMessage(content=json.dumps(state["final_data"], indent=2))]},
-                config
-            )
-            summary = summary_result["messages"][-1].content
-            state["final_data"]["summary"] = summary
-            yield json.dumps({
-                "step": "summary",
-                "status": "success",
-                "data": {"summary": summary},
-                "error": None,
-                "session_id": thread_id,
-                "timestamp": time.time()
-            }) + "\n"
-
-            # Step 8: Convert to speech
-            tts_file = "https://example.com/speech.mp3"
-            state["final_data"]["tts_file"] = tts_file
-            yield json.dumps({
-                "step": "tts",
-                "status": "success",
-                "data": {"tts_file": tts_file},
-                "error": None,
-                "session_id": thread_id,
-                "timestamp": time.time()
-            }) + "\n"
-
-            # Final result
-            result = {
-                "session_id": thread_id,
-                "final_data": {
-                    "customer": state["final_data"]["customer"],
-                    "engineer": state["final_data"]["engineer"],
-                    "risk": state["final_data"]["risk"],
-                    "diagram_url": state["final_data"].get("diagram_url"),
-                },
-                "summary": summary,
-                "tts_file": tts_file,
-                "status": "success"
-            }
-            yield json.dumps(result) + "\n"
-
-            # Update state to mark workflow as done
-            state["workflow_done"] = True
-            update_conversation_state(thread_id, state)
-        except Exception as e:
-            yield json.dumps({
-                "step": "error",
-                "status": "error",
-                "error": str(e),
-                "session_id": thread_id,
-                "timestamp": time.time()
-            }) + "\n"
-
-    return StreamingResponse(
-        generate_stream(),
-        media_type="application/json"
-    )
-
-@app.post("/generate_product")
-async def generate_product(request: RunWorkflowRequest, current_user: User = Depends(get_current_user)):
-    """Generate product data for a given thread_id"""
-    state = get_conversation_state(request.thread_id)
-    
-    # Verify ownership
-    if state.get("username") != current_user.username:
-        raise HTTPException(status_code=403, detail="Not authorized to access this conversation")
-    config = state["config"]
-
-    # Check if clarifier is done
-    if not state.get("clarifier_done", False):
-        raise HTTPException(status_code=400, detail="Clarifier conversation not completed")
-
-    try:
-        # Get model and agent
-        model_provider = state.get("model_provider", "groq")
-        model = get_model(provider=model_provider)
-        product_agent = get_product_agent(model)
-
-        # Run product agent
-        product_result = product_agent.invoke({"messages": state["messages"]}, config)
-        product_messages = product_result["messages"]
-        product_response = product_messages[-1].content
-        product_obj = process_agent_response(product_response, ProductResp)
-
-        if product_obj:
-            state["final_data"]["product"] = product_obj.model_dump()
-            # Ensure at least 5 features
-            if len(product_obj.features) < 5:
-                retry_message = HumanMessage(content="Generate a product response with at least 5 features based on our conversation.")
-                product_result = product.invoke({"messages": product_messages + [retry_message]}, config)
-                product_messages = product_result["messages"]
-                product_response = product_messages[-1].content
-                product_obj = process_agent_response(product_response, ProductResp)
-                if product_obj:
-                    state["final_data"]["product"] = product_obj.model_dump()
-
-            # Generate diagram (simulated)
-            diagram_url = "https://example.com/diagram.png"
-            state["final_data"]["diagram_url"] = diagram_url
-
-            # Update state
-            update_conversation_state(request.thread_id, state)
-
-            return {
-                "session_id": request.thread_id,
-                "product_data": state["final_data"]["product"],
-                "diagram_url": diagram_url,
-                "status": "success"
-            }
-        else:
-            raise HTTPException(status_code=500, detail="Failed to generate product data")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error generating product: {str(e)}")
-
-async def run_workflow_background_with_progress(thread_id: str, config: dict):
-    """Run the workflow in the background with progress tracking"""
-    state = get_conversation_state(thread_id)
-
-    try:
-        # Get model and agents
-        model_provider = state.get("model_provider", "groq")
-        model = get_model(provider=model_provider)
-        
-        product_agent = get_product_agent(model)
-        from src.agents.customer import get_customer_agent
-        customer_runner = get_customer_agent(model)
-        engineer_agent = get_engineer_agent(model)
-        risk_agent = get_risk_agent(model)
-        summarizer = get_summarizer_agent(model)
-
-        # Update progress: Starting product agent
-        state["progress"] = {
-            "current_step": "product",
-            "status": "running",
-            "message": "Generating product specifications..."
-        }
-        update_conversation_state(thread_id, state)
-
-        # Run product agent
-        product_result = product_agent.invoke({"messages": state["messages"]}, config)
-        product_messages = product_result["messages"]
-        product_response = product_messages[-1].content
-        product_obj = process_agent_response(product_response, ProductResp)
-
-        if product_obj:
-            state["final_data"]["product"] = product_obj.model_dump()
-            # Ensure at least 5 features
-            if len(product_obj.features) < 5:
-                retry_message = HumanMessage(content="Generate a product response with at least 5 features based on our conversation.")
-                product_result = product_agent.invoke({"messages": product_messages + [retry_message]}, config)
-                product_messages = product_result["messages"]
-                product_response = product_messages[-1].content
-                product_obj = process_agent_response(product_response, ProductResp)
-                if product_obj:
-                    state["final_data"]["product"] = product_obj.model_dump()
-
-            # Generate diagram (simulated)
-            diagram_url = "https://example.com/diagram.png"
-            state["final_data"]["diagram_url"] = diagram_url
-
-            # Update progress: Product agent complete
-            state["progress"] = {
-                "current_step": "product",
-                "status": "completed",
-                "message": "Product specifications generated successfully"
-            }
-            update_conversation_state(thread_id, state)
-
-        # Update progress: Starting customer agent
-        state["progress"] = {
-            "current_step": "customer",
-            "status": "running",
-            "message": "Analyzing customer segments..."
-        }
-        update_conversation_state(thread_id, state)
-
-        # Run customer agent
-        customer_result = customer_runner(product_response)
-        state["final_data"]["customer"] = json.loads(customer_result)
-
-        # Update progress: Customer agent complete
-        state["progress"] = {
-            "current_step": "customer",
-            "status": "completed",
-            "message": "Customer analysis completed"
-        }
-        update_conversation_state(thread_id, state)
-
-        # Update progress: Starting engineer agent
-        state["progress"] = {
-            "current_step": "engineer",
-            "status": "running",
-            "message": "Evaluating technical feasibility..."
-        }
-        update_conversation_state(thread_id, state)
-
-        # Run engineer agent
-        engineer_result = engineer_agent.invoke(
-            {"messages": [HumanMessage(content=json.dumps(state["final_data"]["customer"]))]},
-            config
-        )
-        engineer_response = engineer_result["messages"][-1].content
-        state["final_data"]["engineer"] = {"analysis": json.loads(engineer_response)}
-
-        # Update progress: Engineer agent complete
-        state["progress"] = {
-            "current_step": "engineer",
-            "status": "completed",
-            "message": "Technical feasibility evaluation completed"
-        }
-        update_conversation_state(thread_id, state)
-
-        # Update progress: Starting risk agent
-        state["progress"] = {
-            "current_step": "risk",
-            "status": "running",
-            "message": "Assessing project risks..."
-        }
-        update_conversation_state(thread_id, state)
-
-        # Run risk agent
-        risk_result = risk_agent.invoke(
-            {"messages": [HumanMessage(content=engineer_response)]},
-            config
-        )
-        risk_response = risk_result["messages"][-1].content
-        state["final_data"]["risk"] = {"assessment": json.loads(risk_response)}
-
-        # Update progress: Risk agent complete
-        state["progress"] = {
-            "current_step": "risk",
-            "status": "completed",
-            "message": "Risk assessment completed"
-        }
-        update_conversation_state(thread_id, state)
-
-        # Update progress: Starting summarizer
-        state["progress"] = {
-            "current_step": "summary",
-            "status": "running",
-            "message": "Generating final summary..."
-        }
-        update_conversation_state(thread_id, state)
-
-        # Generate final summary
-        summary_result = summarizer.invoke(
-            {"messages": [HumanMessage(content=json.dumps(state["final_data"], indent=2))]},
-            config
-        )
-        summary = summary_result["messages"][-1].content
-        state["final_data"]["summary"] = summary
-
-        # Update progress: Summary complete
-        state["progress"] = {
-            "current_step": "summary",
-            "status": "completed",
-            "message": "Final summary generated"
-        }
-        update_conversation_state(thread_id, state)
-
-        # Update progress: Starting TTS
-        state["progress"] = {
-            "current_step": "tts",
-            "status": "running",
-            "message": "Converting summary to speech..."
-        }
-        update_conversation_state(thread_id, state)
-
-        # Convert summary to speech (simulated)
         tts_file = "https://example.com/speech.mp3"
-        state["final_data"]["tts_file"] = tts_file
-
-        # Update progress: TTS complete
-        state["progress"] = {
-            "current_step": "tts",
-            "status": "completed",
-            "message": "Speech conversion completed"
-        }
-        update_conversation_state(thread_id, state)
-
-        # Update state to mark workflow as done
-        state["workflow_done"] = True
-        update_conversation_state(thread_id, state)
-    except Exception as e:
-        print(f"Error running workflow: {str(e)}")
-        state["workflow_error"] = str(e)
-        state["progress"] = {
-            "current_step": "error",
-            "status": "error",
-            "message": f"Error: {str(e)}"
-        }
-        update_conversation_state(thread_id, state)
-
-@app.get("/get_progress/{thread_id}")
-async def get_progress(thread_id: str, current_user: User = Depends(get_current_user)):
-    """Get the current progress of the workflow"""
-    state = get_conversation_state(thread_id)
-
-    # Verify ownership
-    if state.get("username") != current_user.username:
-        raise HTTPException(status_code=403, detail="Not authorized to access this conversation")
-
-    if "progress" not in state:
-        return {
-            "session_id": thread_id,
-            "progress": {
-                "current_step": "not_started",
-                "status": "idle",
-                "message": "Workflow has not started yet"
-            }
-        }
-
-    return {
-        "session_id": thread_id,
-        "progress": state["progress"],
-        "workflow_done": state.get("workflow_done", False)
-    }
-
-@app.post("/run_workflow_with_progress")
-async def run_workflow_with_progress(request: RunWorkflowRequest, current_user: User = Depends(get_current_user)):
-    """Run the workflow for a given thread_id with progress tracking"""
-    state = get_conversation_state(request.thread_id)
-    
-    # Verify ownership
-    if state.get("username") != current_user.username:
-        raise HTTPException(status_code=403, detail="Not authorized to access this conversation")
-    """Run the workflow for a given thread_id with progress tracking"""
-    state = get_conversation_state(request.thread_id)
-    config = state["config"]
-
-    # Check if clarifier is done
-    if not state.get("clarifier_done", False):
-        raise HTTPException(status_code=400, detail="Clarifier conversation not completed")
-
-    # Run the workflow in the background with progress tracking
-    background_tasks = BackgroundTasks()
-    background_tasks.add_task(run_workflow_background_with_progress, request.thread_id, config)
-
-    return {
-        "status": "workflow_started",
-        "session_id": request.thread_id
-    }
-
-
-@app.post("/complete_workflow")
-async def complete_workflow(request: RunWorkflowRequest):
-    """Complete the workflow for a given thread_id"""
-    state = get_conversation_state(request.thread_id)
-    config = state["config"]
-
-    # Check if product data is available
-    if not state["final_data"].get("product"):
-        raise HTTPException(status_code=400, detail="Product data not available")
-
-    try:
-        # Get model and agents
-        model_provider = state.get("model_provider", "groq")
-        model = get_model(provider=model_provider)
         
-        from src.agents.customer import get_customer_agent
-        customer_runner = get_customer_agent(model)
-        engineer_agent = get_engineer_agent(model)
-        risk_agent = get_risk_agent(model)
-        summarizer = get_summarizer_agent(model)
-
-        # Run customer agent
-        product_response = json.dumps(state["final_data"]["product"])
-        customer_result = customer_runner(product_response)
-        state["final_data"]["customer"] = json.loads(customer_result)
-
-        print("Customer agent completed")
-
-        # Run engineer agent
-        engineer_result = engineer_agent.invoke(
-            {"messages": [HumanMessage(content=json.dumps(state["final_data"]["customer"]))]},
-            config
-        )
-        engineer_response = engineer_result["messages"][-1].content
-        state["final_data"]["engineer"] = {"analysis": json.loads(engineer_response)}
-
-        print("Engineer agent completed")
-
-        # Run risk agent
-        risk_result = risk_agent.invoke(
-            {"messages": [HumanMessage(content=engineer_response)]},
-            config
-        )
-        risk_response = risk_result["messages"][-1].content
-        state["final_data"]["risk"] = {"assessment": json.loads(risk_response)}
-
-        print("Risk agent completed")
-
-        # Generate final summary
-        summary_result = summarizer.invoke(
-            {"messages": [HumanMessage(content=json.dumps(state["final_data"], indent=2))]},
-            config
-        )
-        summary = summary_result["messages"][-1].content
-        state["final_data"]["summary"] = summary
-
-        print("Summary generated")
-
-        try:
-                print("Generating diagram URL...")
-                state["final_data"]["diagram_url"] = generate_mermaid_link(state["final_data"])
-                print("Diagram URL generated")
-        except Exception as e:
-            print(f"Error generating diagram URL: {e}")
-
-        print("Diagram URL generated")
-        # Convert summary to speech (simulated)
-        tts_file = "https://example.com/speech.mp3"
-        state["final_data"]["tts_file"] = tts_file
-
-        # Update state to mark workflow as done
-        state["workflow_done"] = True
-        update_conversation_state(request.thread_id, state)
-
         return {
-            "session_id": request.thread_id,
-            "final_data": {
-                "customer": state["final_data"]["customer"],
-                "engineer": state["final_data"]["engineer"],
-                "risk": state["final_data"]["risk"],
-                "diagram_url": state["final_data"].get("diagram_url"),
-            },
             "summary": summary,
             "tts_file": tts_file,
+            "raw_response": summary_response
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error generating summary: {str(e)}")
+
+@app.post("/generate_diagram")
+async def generate_diagram(request: DiagramRequest):
+    """Generate a Mermaid diagram from project summary"""
+    try:
+        diagram_url = generate_mermaid_link(json.dumps(request.project_summary))
+        return {
+            "diagram_url": diagram_url,
             "status": "success"
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error completing workflow: {str(e)}")
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+        print(f"Diagram generation error: {e}")
+        raise HTTPException(status_code=500, detail=f"Error generating diagram: {str(e)}")
