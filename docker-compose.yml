@@ -20,8 +20,10 @@ services:
     networks:
       - app-network
     restart: unless-stopped
+    env_file:
+      - ./frontend/.env
     environment:
-      - NEXT_PUBLIC_API_URL=/api
+      - BACKEND_URL=http://backend:8000
 
   nginx:
     image: nginx:alpine
@@ -36,6 +38,33 @@ services:
     networks:
       - app-network
     restart: unless-stopped
+
+  mongo:
+    image: mongo:latest
+    container_name: hackwave-mongo
+    command: [ "--replSet", "rs0", "--bind_ip_all", "--port", "27017" ]
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  mongo-init:
+    image: mongo:latest
+    container_name: hackwave-mongo-init
+    restart: "no"
+    depends_on:
+      - mongo
+    command: >
+      mongosh --host mongo:27017 --eval  'try { rs.status() } catch (err) { rs.initiate({_id:"rs0", members:[{_id:0, host:"mongo:27017"}]}) }'
+    networks:
+      - app-network
+
+volumes:
+  mongo_data:
+
 
 networks:
   app-network:

@@ -53,16 +53,16 @@ EXAMPLE 1:
 Input: {{"name": "TaskManager", "features": [{{"name": "Create Tasks"}}, {{"name": "Set Reminders"}}, {{"name": "Share Lists"}}]}}
 Output:
 {{
-  "diagram": "flowchart TD\\n    A[TaskManager App] --> B[Create Tasks]\\n    A --> C[Set Reminders]\\n    A --> D[Share Lists]\\n    B --> E[Local Storage]\\n    C --> E\\n    D --> F[Cloud Sync]\\n    E --> F",
-  "explanation": "Shows main app connecting to three core features with data flow to storage and cloud"
+  "diagram": "flowchart TD\\n    A[TaskManager App] --> B[Create Tasks]\\n    A --> C[Set Reminders]\\n    A --> D[Share Lists]\\n    B --> E[Local Storage]\\n    C --> E\\n    D --> F[Cloud Sync]\\n    E --> F\\n    F --> G{{Checker}}\\n    G -->|Valid| H[Success]\\n    G -->|Invalid| I[Error]",
+  "explanation": "Shows main app connecting to three core features with data flow to storage and cloud, including a validation step"
 }}
 
 EXAMPLE 2:
 Input: {{"name": "EcommerceApp", "features": [{{"name": "Product Catalog"}}, {{"name": "Shopping Cart"}}, {{"name": "Checkout"}}], "tech_stack": ["React", "Node.js", "MongoDB"]}}
 Output:
 {{
-  "diagram": "flowchart TD\\n    subgraph Frontend\\n        A[React App]\\n        B[Product Catalog]\\n        C[Shopping Cart]\\n        D[Checkout]\\n    end\\n    subgraph Backend\\n        E[Node.js API]\\n        F[MongoDB]\\n    end\\n    A --> B\\n    A --> C\\n    A --> D\\n    B --> E\\n    C --> E\\n    D --> E\\n    E --> F",
-  "explanation": "Architecture showing frontend components connected to backend API and database"
+  "diagram": "flowchart TD\\n    subgraph Frontend\\n        A[React App]\\n        B[Product Catalog]\\n        C[Shopping Cart]\\n        D[Checkout]\\n    end\\n    subgraph Backend\\n        E[Node.js API]\\n        F[MongoDB]\\n    end\\n    A --> B\\n    A --> C\\n    A --> D\\n    B --> E\\n    C --> E\\n    D --> E\\n    E --> F\\n    F --> G{{Checker}}\\n    G -->|Pass| H[Confirmed]\\n    G -->|Fail| I[Rejected]",
+  "explanation": "Architecture showing frontend components connected to backend API and database with a final check"
 }}
 
 Now generate a diagram for this project:
@@ -75,9 +75,11 @@ INSTRUCTIONS:
 2. Generate a Mermaid flowchart using 'flowchart TD' syntax
 3. Use subgraphs to organize related components (Frontend, Backend, Features, etc.)
 4. Include clear node labels with meaningful connections
-5. Keep it organized and readable with proper spacing
-6. Use \\n for new lines in the diagram string
-7. Return ONLY valid JSON in this exact format (no markdown, no extra text):
+5. **CRITICAL**: You MUST include a node labeled "Checker" (or similar validation step) at a logical point in the flow (e.g., before saving data, before finalizing an order, or as a system health check).
+6. **CRITICAL**: Escape all special characters in node labels. Do NOT use parentheses '()' or brackets '[]' inside the label text itself. Use quotes if needed.
+7. Keep it organized and readable with proper spacing
+8. Use \\n for new lines in the diagram string
+9. Return ONLY valid JSON in this exact format (no markdown, no extra text):
 
 {{
   "diagram": "flowchart TD\\n    ...",
@@ -158,6 +160,7 @@ def generate_mermaid_from_toon(toon_data: Dict[str, Any]) -> Optional[str]:
             
             # Add features or components
             features = toon_data.get('features', [])
+            last_feature_id = None
             if features:
                 diagram_lines.append(f"    subgraph Features")
                 for feature in features[:5]:  # Limit to 5 for clarity
@@ -165,7 +168,7 @@ def generate_mermaid_from_toon(toon_data: Dict[str, Any]) -> Optional[str]:
                         feature_name = feature.get('name', 'Feature')
                     else:
                         feature_name = str(feature)
-                    add_node(feature_name, root_id)
+                    last_feature_id = add_node(feature_name, root_id)
                 diagram_lines.append("    end")
             
             # Add tech stack if present
@@ -175,6 +178,29 @@ def generate_mermaid_from_toon(toon_data: Dict[str, Any]) -> Optional[str]:
                 for tech in tech_stack[:5]:
                     add_node(tech, root_id)
                 diagram_lines.append("    end")
+                
+            # Add Checker Node
+            checker_id = f"N{node_id}"
+            node_id += 1
+            diagram_lines.append(f"    {checker_id}{{Checker}}")
+            
+            # Connect to last feature or root
+            if last_feature_id:
+                diagram_lines.append(f"    {last_feature_id} --> {checker_id}")
+            else:
+                diagram_lines.append(f"    {root_id} --> {checker_id}")
+                
+            # Add outcomes
+            pass_id = f"N{node_id}"
+            node_id += 1
+            fail_id = f"N{node_id}"
+            node_id += 1
+            
+            diagram_lines.append(f"    {pass_id}[Passed]")
+            diagram_lines.append(f"    {fail_id}[Failed]")
+            
+            diagram_lines.append(f"    {checker_id} -->|Yes| {pass_id}")
+            diagram_lines.append(f"    {checker_id} -->|No| {fail_id}")
         
         diagram_code = '\n'.join(diagram_lines)
         

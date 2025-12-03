@@ -39,19 +39,15 @@ export async function getUserById(id: string) {
 }
 
 export async function createUser(email: string, name: string, password: string) {
-  try {
-    const user = await prisma.user.create({
-      data: {
-        email,
-        name,
-        password,
-      },
-    });
-    return user;
-  } catch (error) {
-    console.error('Error creating user:', error);
-    return null;
-  }
+  // Do not catch error here, let it propagate to the caller
+  const user = await prisma.user.create({
+    data: {
+      email,
+      name,
+      password,
+    },
+  });
+  return user;
 }
 
 export async function updateUser(id: string, data: any) {

@@ -20,6 +20,7 @@ COPY . .
 # Uncomment the following line in case you want to disable telemetry during the build.
 ENV NEXT_TELEMETRY_DISABLED 1
 
+RUN npx prisma generate
 RUN npm run build
 
 # Production image, copy all the files and run next
@@ -43,6 +44,12 @@ RUN chown nextjs:nodejs .next
 COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
 COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
 
+# Copy prisma schema
+COPY --from=builder /app/prisma ./prisma
+
+# Install prisma globally to run db push
+RUN npm install -g prisma@6
+
 USER nextjs
 
 EXPOSE 3000
@@ -51,4 +58,4 @@ ENV PORT 3000
 # set hostname to localhost
 ENV HOSTNAME "0.0.0.0"
 
-CMD ["node", "server.js"]
+CMD ["sh", "-c", "npx prisma db push && node server.js"]
